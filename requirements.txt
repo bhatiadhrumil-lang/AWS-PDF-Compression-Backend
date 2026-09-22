@@ -1,0 +1,5 @@
+# Runtime dependencies only (keep the image small).
+# Ghostscript does the compression; boto3 talks to S3.
+# NOTE: pikepdf/Pillow/PyPDF2 were installed by the original image but never
+# imported anywhere — removed to shrink build time, image size, cold starts.
+boto3
