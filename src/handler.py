@@ -10,14 +10,17 @@ import traceback
 from common import s3 as s3_client
 from common.cleanup import temp_workdir
 from common.filenames import (
+    ROTATE_MANIFEST_SUFFIX,
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
     has_pdf_extension,
     is_merge_manifest_key,
+    is_rotate_manifest_key,
     is_split_manifest_key,
     merged_output_key_for,
     output_key_for,
     request_id_from_manifest,
+    rotate_output_key_for,
     sanitize_split_stem,
     split_output_key_for,
 )
@@ -42,6 +45,14 @@ from operations.split import (
     resolve_ranges,
     split_pdf,
     validate_split_input_key,
+)
+from operations.rotate import (
+    RotateError,
+    load_rotate_request,
+    page_count_of as rotate_page_count_of,
+    resolve_pages,
+    rotate_pdf,
+    validate_rotate_input_key,
 )
 
 
@@ -73,6 +84,8 @@ def process_record(record, cfg=None):
         return process_merge_record(bucket, key, cfg)
     if is_split_manifest_key(key):
         return process_split_record(bucket, key, cfg)
+    if is_rotate_manifest_key(key):
+        return process_rotate_record(bucket, key, cfg)
     if not has_pdf_extension(key):
         return skipped("not a .pdf object")
 
@@ -308,6 +321,95 @@ def process_split_record(bucket, manifest_key, cfg=None):
 
     print("Split done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "split",
+            "output_key": out_key}
+
+
+def process_rotate_record(bucket, manifest_key, cfg=None):
+    """Process one rotate-request manifest. Returns a result dict (never raises).
+
+    Downloads the manifest, then the single source PDF, into a unique temp
+    workdir (removed on success and failure), validates, rotates the
+    selected pages (or all), and uploads a single
+    "rotate/<request-id>/<stem>-rotated.pdf" object.
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("ROTATE FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "rotate", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-rotate-") as workdir:
+            manifest_file = os.path.join(workdir, "request.rotate.json")
+            print("Downloading rotate request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download rotate request: %s" % exc)
+            try:
+                request = load_rotate_request(manifest_file)
+            except RotateError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            try:
+                validate_rotate_input_key(source_key)
+            except RotateError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading rotate input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_count = rotate_page_count_of(local_input, source_key)
+            except RotateError as exc:
+                return failed(str(exc))
+
+            if request["pages"] == "all":
+                selected = None
+            else:
+                try:
+                    # Reuses the split range cap: rotation is lightweight, so
+                    # no new knob — the cap is about manifest sanity.
+                    selected = resolve_pages(
+                        request["pages"], page_count, cfg.split_max_ranges)
+                except RotateError as exc:
+                    return failed(str(exc))
+
+            rotated_file = os.path.join(workdir, "rotated.pdf")
+            print("Rotating %d page(s) by %d for manifest=%r"
+                  % (page_count, request["rotation"], manifest_key))
+            try:
+                rotate_pdf(local_input, source_key, request["rotation"],
+                           selected, rotated_file)
+            except RotateError as exc:
+                return failed(str(exc))
+
+            out_key = rotate_output_key_for(request["output_name"], manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(rotated_file, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload rotated PDF: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("Rotate done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "rotate",
             "output_key": out_key}
 
 

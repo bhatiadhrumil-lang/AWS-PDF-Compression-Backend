@@ -15,6 +15,8 @@ MERGE_OUTPUT_PREFIX = "merged-"
 MERGE_MANIFEST_SUFFIX = ".merge.json"
 SPLIT_MANIFEST_SUFFIX = ".split.json"
 SPLIT_OUTPUT_DIR = "split"
+ROTATE_MANIFEST_SUFFIX = ".rotate.json"
+ROTATE_OUTPUT_DIR = "rotate"
 MAX_OUTPUT_BASENAME_LEN = 200
 
 
@@ -61,6 +63,15 @@ def is_split_manifest_key(decoded_key):
     routed to the split operation instead of compression.
     """
     return str(decoded_key).lower().endswith(SPLIT_MANIFEST_SUFFIX)
+
+
+def is_rotate_manifest_key(decoded_key):
+    """True if the key is a rotate-request manifest (case-insensitive).
+
+    Manifests live under e.g. "rotate-requests/<id>.rotate.json" and are
+    routed to the rotate operation instead of compression.
+    """
+    return str(decoded_key).lower().endswith(ROTATE_MANIFEST_SUFFIX)
 
 
 def request_id_from_manifest(manifest_key, suffix):
@@ -116,13 +127,12 @@ def merged_output_key_for(output_name, manifest_key=""):
 
 
 def sanitize_split_stem(name):
-    """Sanitize a user-supplied split output stem to a safe flat basename.
+    """Sanitize a user-supplied output stem to a safe flat basename.
 
-    Same traversal/control-char rules as sanitize_output_basename, but the
-    result is a STEM (no ".pdf" forced): a trailing ".pdf"/".zip" supplied
-    by the user is stripped so "<name>-split.zip" never becomes
-    "<name>.pdf-split.zip". Spaces/parens/brackets/"&"/unicode preserved.
-    Returns "" if nothing usable remains (caller falls back).
+    Shared by split and rotate (both need a ".pdf"/".zip"-free stem):
+    drops directory components (no path traversal), strips control
+    characters, removes a trailing ".pdf"/".zip", keeps spaces, parentheses,
+    brackets, "&", unicode. Returns "" if nothing usable remains.
     """
     if name is None:
         return ""
@@ -163,3 +173,24 @@ def split_output_key_for(output_name, manifest_key=""):
     if len(zip_name) > MAX_OUTPUT_BASENAME_LEN:
         zip_name = stem[: MAX_OUTPUT_BASENAME_LEN - len("-split.zip")] + "-split.zip"
     return "%s/%s/%s" % (SPLIT_OUTPUT_DIR, request_id, zip_name)
+
+
+def rotate_output_key_for(output_name, manifest_key=""):
+    """Build the rotated-PDF output key: "rotate/<id>/<stem>-rotated.pdf".
+
+    <id> comes from the manifest basename ("<id>.rotate.json"); if the
+    manifest is oddly shaped the id segment falls back to "request".
+    The stem falls back to the id (or "document"). The key always embeds
+    the request id, so the frontend can poll this EXACT key and concurrent
+    users can never collide.
+    """
+    request_id = sanitize_split_stem(
+        request_id_from_manifest(manifest_key, ROTATE_MANIFEST_SUFFIX))
+    if not request_id:
+        request_id = "request"
+    stem = sanitize_split_stem(output_name) or request_id
+    pdf_name = "%s-rotated.pdf" % stem
+    if len(pdf_name) > MAX_OUTPUT_BASENAME_LEN:
+        pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-rotated.pdf")]
+                    + "-rotated.pdf")
+    return "%s/%s/%s" % (ROTATE_OUTPUT_DIR, request_id, pdf_name)

@@ -24,13 +24,14 @@ input bucket AFTER the source PDF, e.g. "split-requests/<request-id>.split.json"
 """
 import json
 import os
-import re
 import zipfile
 
 from common.filenames import decode_s3_key, has_pdf_extension
-
-_RANGE_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
-_SINGLE_RE = re.compile(r"^\s*(\d+)\s*$")
+from common.page_ranges import (
+    RangeError,
+    parse_page_range as _parse_range,
+    resolve_ranges as _resolve_ranges,
+)
 
 
 class SplitError(Exception):
@@ -109,55 +110,25 @@ def load_split_request(path):
 def parse_page_range(token):
     """Parse one range token to (start, end), 1-indexed inclusive.
 
-    Accepts "5" -> (5, 5) and "1-3" -> (1, 3) (whitespace tolerated).
-    Raises SplitError for malformed, zero, negative, or reversed ranges.
-    Page-count bounds are NOT checked here (see resolve_ranges).
+    Shared parser (common.page_ranges); RangeError is translated to
+    SplitError so this operation's contract is unchanged.
     """
-    if not isinstance(token, str):
-        raise SplitError("invalid page range: %r" % (token,))
-    single = _SINGLE_RE.match(token)
-    if single:
-        page = int(single.group(1))
-        if page < 1:
-            raise SplitError("invalid page range %r: pages start at 1" % token)
-        return (page, page)
-    span = _RANGE_RE.match(token)
-    if span:
-        start, end = int(span.group(1)), int(span.group(2))
-        if start < 1 or end < 1:
-            raise SplitError("invalid page range %r: pages start at 1" % token)
-        if start > end:
-            raise SplitError(
-                "invalid page range %r: start page exceeds end page" % token)
-        return (start, end)
-    raise SplitError(
-        "invalid page range %r: use '5' or '1-3'" % token)
+    try:
+        return _parse_range(token)
+    except RangeError as exc:
+        raise SplitError(str(exc))
 
 
 def resolve_ranges(tokens, page_count, max_ranges):
     """Validate tokens against the PDF and return [(start, end)] in order.
 
-    Rejects: too many ranges, malformed ranges, pages outside 1..page_count,
-    and duplicate/overlapping ranges (each source page may appear at most
-    once, so outputs never surprise the requester). Raises SplitError.
+    Shared resolver (common.page_ranges); RangeError is translated to
+    SplitError so this operation's contract is unchanged.
     """
-    if len(tokens) > max_ranges:
-        raise SplitError(
-            "too many ranges: %d exceeds the limit of %d"
-            % (len(tokens), max_ranges))
-    resolved = [parse_page_range(t) for t in tokens]
-    covered = set()
-    for token, (start, end) in zip(tokens, resolved):
-        if end > page_count:
-            raise SplitError(
-                "page range %r exceeds the document (%d pages)"
-                % (token, page_count))
-        overlap = [p for p in range(start, end + 1) if p in covered]
-        if overlap:
-            raise SplitError(
-                "page range %r overlaps an earlier range" % token)
-        covered.update(range(start, end + 1))
-    return resolved
+    try:
+        return _resolve_ranges(tokens, page_count, max_ranges)
+    except RangeError as exc:
+        raise SplitError(str(exc))
 
 
 def check_split_output_count(count, max_outputs):

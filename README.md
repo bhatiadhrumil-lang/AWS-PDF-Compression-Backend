@@ -2,8 +2,9 @@
 
 Official backend source of truth for the PDF platform's server-side processing.
 Today: **PDF compression**, **PDF merge**, and **PDF split** — all three
-implemented, deployed, and verified end-to-end on AWS. More operations will
-plug into `src/operations/` later.
+implemented, deployed, and verified end-to-end on AWS — plus **PDF rotate**
+(implemented, tested, not yet deployed). More operations will plug into
+`src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
 > tags, no versioned paths. The frontend repo is separate and untouched.
@@ -40,9 +41,11 @@ src/
     compress.py          Ghostscript compression (settings unchanged)
     merge.py             pypdf merge (multi-file -> one output)
     split.py             pypdf split (one input -> ZIP of PDFs)
+    rotate.py            pypdf rotate (one input -> one rotated PDF)
   common/
     s3.py                head/download/upload (lazy boto3 import)
     filenames.py         key decoding, .pdf detection, output naming
+    page_ranges.py       shared page-range parser (split + rotate)
     validation.py        size limits, %PDF- magic check
     cleanup.py           per-record temp workdirs
 tests/                   stdlib unittest, all AWS calls mocked
@@ -127,13 +130,28 @@ output, merged with pypdf in exactly the requested order.
 Status: Backend implemented + deployed + verified end-to-end on AWS
 (split-all and ranges modes, ZIP contents validated, compress + merge
 regressions green).
-
 Single-file, multi-output operation: one source PDF + manifest →
 one `split/<request-id>/<stem>-split.zip` containing the requested parts.
 Two modes: `all` (one PDF per page: `<stem>-page-<n>.pdf`) and `ranges`
 (one PDF per requested range in requested order: `<stem>-page-5.pdf`,
 `<stem>-pages-1-3.pdf`). Split reuses the manifest pattern because it
 needs parameters (mode/ranges) that a bare S3 upload cannot express.
+
+### Rotate PDF
+
+Status: Backend implemented + local/docker-tested, **NOT deployed**
+(no `.rotate.json` S3 trigger configured yet; Lambda still runs the
+pre-rotate image).
+
+Single-file, single-output operation: one source PDF + manifest →
+one `rotate/<request-id>/<stem>-rotated.pdf`. Rotation is exactly 90, 180,
+or 270 degrees clockwise (anything else rejected), applied to all pages or
+to selected pages via the shared split range syntax (`["1-3", "5"]`,
+same validation: no 0/negatives/reversed/out-of-bounds/duplicates/
+overlaps). Unselected pages pass through untouched; order, count, and
+metadata are preserved (pypdf `/Rotate`, no rasterization). No new limits:
+source size reuses `MAX_FILE_SIZE_MB`; page selection reuses the
+`SPLIT_MAX_RANGES` cap.
 
 ## Single-file vs multi-file operations
 
@@ -195,9 +213,10 @@ Handler routing: `process_record` sends `*.merge.json` keys to
 and `*.pdf` keys to the untouched compress
 pipeline; anything else is skipped. A merge/split manifest never enters the
 compress path (it is not a `.pdf`) and PDFs never enter the merge/split path.
+A `*.rotate.json` manifest is routed to `process_rotate_record` the same way
+(deployment adds the matching S3 suffix trigger; not configured yet).
 
 ## Split request contract
-
 Manifest `split-requests/<request-id>.split.json`, uploaded AFTER the
 source PDF (same input bucket):
 
@@ -255,6 +274,49 @@ malformed manifest, wrong operation, missing input key or S3 object,
 invalid/encrypted PDF, bad mode, invalid/out-of-bounds/overlapping ranges,
 too many ranges or outputs, ZIP failure, upload failure. User-safe reasons;
 tracebacks to CloudWatch only.
+
+## Rotate request contract
+
+Manifest `rotate-requests/<request-id>.rotate.json`, uploaded AFTER the
+source PDF (same input bucket):
+
+```json
+{ "operation": "rotate", "input": "uploads/<request-id>/document.pdf",
+  "rotation": 90, "pages": "all", "output_name": "document" }
+```
+
+```json
+{ "operation": "rotate", "input": "uploads/<request-id>/document.pdf",
+  "rotation": 90, "pages": ["1-3", "5"], "output_name": "document" }
+```
+
+* `operation` optional (`.rotate.json` suffix implies rotate; if present
+  must equal `"rotate"`).
+* `input` (required): one plain (decoded) S3 key, same bucket; URL-encoded
+  accepted. Same `.pdf`/size/`%PDF-`/non-empty/not-encrypted checks as
+  split inputs.
+* `rotation` (required): exactly `90`, `180`, or `270` (integers, degrees
+  clockwise — pypdf `page.rotate()`). `0`, `360`, `45`, negatives,
+  strings, floats, and booleans are rejected.
+* `pages` (default `"all"`): `"all"` or a list of `"5"` / `"1-3"` tokens
+  parsed by the shared `common.page_ranges` module — identical validation
+  to split (whitespace tolerated; rejects 0, negatives, empty, malformed,
+  reversed, out-of-bounds, duplicate/overlapping ranges, and more than
+  `SPLIT_MAX_RANGES` ranges). Only listed pages rotate; the rest pass
+  through untouched with order, count, and metadata preserved.
+* `output_name` (optional stem): same sanitization as split; falls back to
+  the request id.
+
+Output: one PDF at `rotate/<request-id>/<stem>-rotated.pdf` (request id
+always embedded — the frontend polls this EXACT key).
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"rotate", "output_key": ..., "reason": ...}`. Covered failures: missing /
+malformed manifest, wrong operation, missing input key or S3 object,
+invalid/encrypted PDF, bad rotation, invalid/out-of-bounds/overlapping
+pages, output failure, upload failure. User-safe reasons; tracebacks to
+CloudWatch only. No new limits or env vars: rotation reuses
+`MAX_FILE_SIZE_MB` and the `SPLIT_MAX_RANGES` cap.
 
 ## Merge limits
 
@@ -349,10 +411,10 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 165 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 223 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
-  src/operations/split.py src/common/*.py
+  src/operations/split.py src/operations/rotate.py src/common/*.py
 ```
 
 Covers: key decoding (spaces/parens/brackets/`+`/`&`/unicode/`%`), `.pdf` case
@@ -365,7 +427,11 @@ sanitization, manifest routing, merge config defaults, plus split:
 split-all (1-page and multi-page), single/span/multi ranges in requested
 order, range-parser rejects (0, beyond-count, reversed, malformed, empty,
 duplicate/overlap), special/unicode/traversal filenames, invalid/missing
-inputs, ZIP contents and part validity, cleanup, split routing and config.
+inputs, ZIP contents and part validity, cleanup, split routing and config,
+plus rotate: 90/180/270 all-pages and selected pages/ranges, selected vs
+unselected verification, order/count/content/metadata preservation, rotation
+rejects (0/360/45/negative/string/float/bool), shared-parser rejects,
+traversal/special filenames, invalid/missing inputs, cleanup, rotate routing.
 
 ## Docker
 
@@ -375,8 +441,8 @@ maintained) does merge concatenation; Ghostscript settings are untouched.
 
 ## Future Architecture
 
-`src/operations/` now hosts `compress.py`, `merge.py`, and `split.py`.
-Future `rotate.py`, `extract.py`, `convert.py`, `watermark.py`, `protect.py`,
+`src/operations/` now hosts `compress.py`, `merge.py`, `split.py`, and
+`rotate.py`. Future `extract.py`, `convert.py`, `watermark.py`, `protect.py`,
 plus editor flattening follow the same pattern, reusing `common/` (s3,
 filenames, validation, cleanup) — parameterized ones reuse the
 manifest-request pattern.
