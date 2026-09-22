@@ -248,10 +248,12 @@ class ParseRequestTest(unittest.TestCase):
         with self.assertRaises(SplitError):
             parse_split_request({"input": "u/d.pdf", "output_name": 7})
 
-    def test_url_encoded_input_accepted(self):
+    def test_manifest_key_used_verbatim(self):
+        # Exact S3 keys pass through untouched — including a literal "+",
+        # which URL-decoding would corrupt into a space.
         req = parse_split_request(
-            {"input": "uploads/My+Report+%28Final%29.pdf"})
-        self.assertEqual(req["input"], "uploads/My Report (Final).pdf")
+            {"input": "uploads/Report+Final (v2).pdf"})
+        self.assertEqual(req["input"], "uploads/Report+Final (v2).pdf")
 
     def test_load_bad_json(self):
         import tempfile

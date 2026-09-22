@@ -429,11 +429,23 @@ back to the manifest id (`merge-requests/<id>.merge.json` →
 ## Filename Handling
 
 S3 event keys are URL-encoded (`" "` → `+`, `(` → `%28`, unicode → `%XX`).
-`decode_s3_key()` (`unquote_plus`) decodes before **every** S3 call — the old
-code used the raw key, so any file with parentheses/brackets/`+`/`&`/unicode
-failed to download (and the output key never matched frontend polling).
+`decode_s3_key()` (`unquote_plus`) decodes **S3 event notification keys**
+before every S3 call — the old code used the raw key, so any file with
+parentheses/brackets/`+`/`&`/unicode failed to download (and the output key
+never matched frontend polling).
 Supported: spaces, parentheses, brackets, `+`, `&`, `=`, `%`, unicode.
 Display names are the frontend's job; keys here are always the true S3 keys.
+
+Manifest keys (`inputs`/`input` in merge/split/rotate/delete manifests) are
+used VERBATIM — never URL-decoded. They are exact object keys authored by
+the frontend, not event encodings: decoding them corrupted real filenames
+(a manifest input `Report+Final.pdf` was mangled into `Report Final.pdf`
+→ 404/NoSuchKey on the live system). Fixed in the `:latest` image
+deployed 2026-09-22 (`sha256:4ce1edd9…`); proven by a live merge that failed
+before the fix and succeeded after, with zero other behavior changes.
+Ghostscript is always invoked with an argument list (no `shell=True`),
+temp files use fixed names inside a unique per-record workdir, and output
+keys preserve the original basename (`compressed-My Report.pdf`).
 
 ## Validation & Limits
 

@@ -167,14 +167,15 @@ class MergeSuccessTest(unittest.TestCase):
         self.assertEqual(page_widths(merged), [float(w) for w in widths])
 
     @NEEDS_PYPDF
-    def test_url_encoded_keys_in_manifest_accepted(self):
-        manifest_inputs = ["uploads/My+Report+%28Final%29.pdf",
-                           "uploads/Second+%5Bv2%5D.pdf"]
-        decoded = ["uploads/My Report (Final).pdf", "uploads/Second [v2].pdf"]
+    def test_manifest_keys_used_verbatim(self):
+        # Manifest keys are exact S3 keys, NOT event encodings: a literal "+"
+        # must survive (unquote_plus would corrupt it into a space).
+        manifest_inputs = ["uploads/My Report (Final).pdf",
+                           "uploads/Report+Final.pdf"]
         result, fake = run_merge(
             manifest_inputs, "m.pdf",
-            extra_objects={decoded[0]: make_pdf_bytes(100, 100),
-                           decoded[1]: make_pdf_bytes(200, 200)})
+            extra_objects={manifest_inputs[0]: make_pdf_bytes(100, 100),
+                           manifest_inputs[1]: make_pdf_bytes(200, 200)})
         self.assertEqual(result["status"], "ok")
         self.assertEqual(page_widths(fake.uploaded["merged-m.pdf"]),
                          [100.0, 200.0])

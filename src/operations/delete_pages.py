@@ -24,7 +24,7 @@ input bucket AFTER the source PDF, e.g. "delete-requests/<request-id>.delete.jso
 """
 import json
 
-from common.filenames import decode_s3_key, has_pdf_extension
+from common.filenames import has_pdf_extension
 from common.page_ranges import RangeError, resolve_ranges
 
 
@@ -47,7 +47,7 @@ def parse_delete_request(data):
     raw_input = data.get("input")
     if not isinstance(raw_input, str) or not raw_input.strip():
         raise DeleteError("delete request must name one input PDF in 'input'")
-    source = decode_s3_key(raw_input.strip())
+    source = raw_input.strip()
     if not source:
         raise DeleteError("delete request must name one input PDF in 'input'")
     raw_pages = data.get("pages")

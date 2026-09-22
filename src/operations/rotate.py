@@ -24,7 +24,7 @@ input bucket AFTER the source PDF, e.g. "rotate-requests/<request-id>.rotate.jso
 """
 import json
 
-from common.filenames import decode_s3_key, has_pdf_extension
+from common.filenames import has_pdf_extension
 from common.page_ranges import RangeError, resolve_ranges
 
 SUPPORTED_ROTATIONS = (90, 180, 270)
@@ -62,7 +62,7 @@ def parse_rotate_request(data):
     raw_input = data.get("input")
     if not isinstance(raw_input, str) or not raw_input.strip():
         raise RotateError("rotate request must name one input PDF in 'input'")
-    source = decode_s3_key(raw_input.strip())
+    source = raw_input.strip()
     if not source:
         raise RotateError("rotate request must name one input PDF in 'input'")
     rotation = parse_rotation(data.get("rotation"))

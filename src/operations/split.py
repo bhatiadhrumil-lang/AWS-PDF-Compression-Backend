@@ -13,8 +13,10 @@ input bucket AFTER the source PDF, e.g. "split-requests/<request-id>.split.json"
                                         # to the request id
     }
 
-* "input" is a plain (decoded) S3 key; a URL-encoded key is also accepted
-  (decoded once via decode_s3_key, idempotent for plain keys).
+* "input" is the EXACT S3 key in the same input bucket, used verbatim
+  (no URL-decoding: manifest keys are exact object keys, not S3 event
+  notification encodings — decoding would corrupt real "+" characters
+  into spaces).
 * Mode "all" emits one PDF per page: "<stem>-page-<n>.pdf".
 * Mode "ranges" emits one PDF per requested range, IN REQUESTED ORDER:
   single page "<stem>-page-<n>.pdf", span "<stem>-pages-<a>-<b>.pdf".
@@ -26,7 +28,7 @@ import json
 import os
 import zipfile
 
-from common.filenames import decode_s3_key, has_pdf_extension
+from common.filenames import has_pdf_extension
 from common.page_ranges import (
     RangeError,
     parse_page_range as _parse_range,
@@ -53,7 +55,7 @@ def parse_split_request(data):
     raw_input = data.get("input")
     if not isinstance(raw_input, str) or not raw_input.strip():
         raise SplitError("split request must name one input PDF in 'input'")
-    source = decode_s3_key(raw_input.strip())
+    source = raw_input.strip()
     if not source:
         raise SplitError("split request must name one input PDF in 'input'")
     mode = data.get("mode", "all")

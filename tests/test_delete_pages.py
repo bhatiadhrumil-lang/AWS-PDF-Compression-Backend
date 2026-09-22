@@ -151,10 +151,10 @@ class ParseRequestTest(unittest.TestCase):
             parse_delete_request(
                 {"input": "u/d.pdf", "pages": ["2"], "output_name": 7})
 
-    def test_url_encoded_input_accepted(self):
+    def test_manifest_key_used_verbatim(self):
         req = parse_delete_request(
-            {"input": "uploads/My+Report+%28Final%29.pdf", "pages": ["2"]})
-        self.assertEqual(req["input"], "uploads/My Report (Final).pdf")
+            {"input": "uploads/Report+Final (v2).pdf", "pages": ["2"]})
+        self.assertEqual(req["input"], "uploads/Report+Final (v2).pdf")
 
     def test_load_bad_json(self):
         import tempfile

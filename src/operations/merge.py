@@ -13,9 +13,10 @@ input bucket, e.g. "merge-requests/<request-id>.merge.json":
                                        # "merged-<request-id>.pdf"
     }
 
-* "inputs" keys are plain (decoded) S3 keys in the SAME input bucket as the
-  manifest. URL-encoded keys are also accepted (decoded once via
-  decode_s3_key, which is idempotent for plain keys).
+* "inputs" keys are the EXACT S3 keys in the SAME input bucket as the
+  manifest, used verbatim (no URL-decoding: manifest keys are exact object
+  keys, not S3 event notification encodings — decoding would corrupt real
+  "+" characters into spaces).
 * Every input is validated (extension, size, %PDF- magic) before it reaches
   the merger; the first invalid input fails the whole request — merging a
   subset silently would violate the ordering guarantee.
@@ -23,7 +24,7 @@ input bucket, e.g. "merge-requests/<request-id>.merge.json":
 """
 import json
 
-from common.filenames import decode_s3_key, has_pdf_extension
+from common.filenames import has_pdf_extension
 from common.validation import has_pdf_magic, size_ok
 
 
@@ -34,7 +35,8 @@ class MergeError(Exception):
 def parse_merge_request(data):
     """Parse and validate a decoded manifest dict.
 
-    Returns {"inputs": [decoded keys in order], "output_name": str}.
+    Returns {"inputs": [exact keys in order], "output_name": str}.
+    Manifest keys are used verbatim (see module docstring).
     Raises MergeError on any contract violation.
     """
     if not isinstance(data, dict):
@@ -55,7 +57,7 @@ def parse_merge_request(data):
     for item in inputs:
         if not isinstance(item, str) or not item.strip():
             raise MergeError("merge inputs must be non-empty S3 key strings")
-        key = decode_s3_key(item.strip())
+        key = item.strip()
         if not key:
             raise MergeError("merge inputs must be non-empty S3 key strings")
         decoded.append(key)

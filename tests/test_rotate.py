@@ -207,10 +207,10 @@ class ParseRequestTest(unittest.TestCase):
             parse_rotate_request(
                 {"input": "u/d.pdf", "rotation": 90, "output_name": 7})
 
-    def test_url_encoded_input_accepted(self):
+    def test_manifest_key_used_verbatim(self):
         req = parse_rotate_request(
-            {"input": "uploads/My+Report+%28Final%29.pdf", "rotation": 90})
-        self.assertEqual(req["input"], "uploads/My Report (Final).pdf")
+            {"input": "uploads/Report+Final (v2).pdf", "rotation": 90})
+        self.assertEqual(req["input"], "uploads/Report+Final (v2).pdf")
 
     def test_load_bad_json(self):
         import tempfile
