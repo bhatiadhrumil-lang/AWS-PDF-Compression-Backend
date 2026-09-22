@@ -1,8 +1,8 @@
 # AWS PDF Processing Backend
 
 Official backend source of truth for the PDF platform's server-side processing.
-Today: **PDF compression**. More operations (merge, split, …) will plug into
-`src/operations/` later — none are implemented yet.
+Today: **PDF compression** and **PDF merge**. More operations (split, …) will
+plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
 > tags, no versioned paths. The frontend repo is separate and untouched.
@@ -22,10 +22,11 @@ S3 input bucket  (ObjectCreated, *.pdf)
 ```text
 src/
   app.py                 Lambda entry (CMD ["app.lambda_handler"])
-  handler.py             multi-record loop + per-record pipeline
+  handler.py             multi-record loop + per-record pipeline + op routing
   config.py              env config (no secrets)
   operations/
     compress.py          Ghostscript compression (settings unchanged)
+    merge.py             pypdf merge (multi-file -> one output)
   common/
     s3.py                head/download/upload (lazy boto3 import)
     filenames.py         key decoding, .pdf detection, output naming
@@ -33,7 +34,7 @@ src/
     cleanup.py           per-record temp workdirs
 tests/                   stdlib unittest, all AWS calls mocked
 Dockerfile               lambda/python:3.12 + ghostscript (unchanged)
-requirements.txt         boto3 only (dead deps removed, see below)
+requirements.txt         boto3 + pypdf
 ```
 
 ## AWS Region
@@ -59,6 +60,124 @@ this task**; deployment happens after review.
   `compressed-<basename of decoded input key>`.
   Example: input `uploads/xyz_My Report (Final).pdf` →
   output `compressed-xyz_My Report (Final).pdf`.
+
+## PDF Operations
+
+### Compress PDF
+
+Status: Implemented (unchanged).
+
+Single-file operation: one `.pdf` upload → one `compressed-<basename>`
+output. See Input/Output sections below.
+
+### Merge PDF
+
+Status: Backend implemented.
+
+Multi-file operation: N ordered input PDFs → one `merged-<name>.pdf`
+output, merged with pypdf in exactly the requested order.
+
+## Single-file vs multi-file operations
+
+Compression is naturally ONE INPUT → ONE OUTPUT, which fits the S3
+`ObjectCreated`-per-file trigger directly: each uploaded `.pdf` is one
+record, processed independently.
+
+Merge is MULTIPLE INPUTS → ONE OUTPUT, which does **not** fit the
+per-file model: N uploads would fire N independent Lambda invocations with
+no ordering and race conditions (whichever file lands last "wins", partial
+sets merge, duplicates, no clean error surface).
+
+Chosen design: a **manifest/request JSON object in S3** (no new service,
+no queue, no database — stays on S3 + Lambda + ECR):
+
+1. The frontend uploads the N PDFs normally to the input bucket
+   (e.g. `uploads/<request-id>/A.pdf`, `B.pdf`, …).
+2. The frontend uploads one manifest last:
+   `merge-requests/<request-id>.merge.json`:
+
+```json
+{
+  "operation": "merge",
+  "inputs": [
+    "uploads/<request-id>/A.pdf",
+    "uploads/<request-id>/B.pdf",
+    "uploads/<request-id>/C.pdf"
+  ],
+  "output_name": "combined.pdf"
+}
+```
+
+3. That single manifest upload fires ONE Lambda invocation, which
+   downloads the inputs **in manifest order**, validates each, merges,
+   and uploads one output object.
+4. The frontend polls `HeadObject` on the known output key
+   (`merged-combined.pdf`), same pattern as compression.
+
+Input contract details:
+
+* `operation` is optional; the `.merge.json` suffix already implies merge,
+  but if present it must equal `"merge"`.
+* `inputs` (required): 2..`MERGE_MAX_FILES` plain (decoded) S3 keys in the
+  **same input bucket** as the manifest, in merge order. URL-encoded keys
+  are also accepted (decoded once; decoding is idempotent for plain keys).
+* `output_name` (optional): sanitized (see below); defaults to
+  `merged-<request-id>.pdf` derived from the manifest key.
+* Ordering is guaranteed: pages appear as A then B then C; nothing is
+  sorted or reordered.
+
+Infra note: the bucket trigger must additionally fire on the manifest
+suffix — add an S3 `ObjectCreated:*` notification with suffix
+`.merge.json` (alongside the existing `.pdf` one) pointing at the same
+Lambda. No other infra change is needed. This manifest pattern also fits
+future Split/Rotate/Edit batch operations.
+
+Handler routing: `process_record` sends `*.merge.json` keys to
+`process_merge_record` and `*.pdf` keys to the untouched compress
+pipeline; anything else is skipped. A merge manifest never enters the
+compress path (it is not a `.pdf`) and PDFs never enter the merge path.
+
+## Merge limits
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MERGE_MAX_FILES` | `20` | max input PDFs per merge request |
+| `MERGE_MAX_TOTAL_MB` | `200` | max combined input size per request (MB) |
+| `MAX_FILE_SIZE_MB` | `100` | max individual input size (shared with compression) |
+
+Rationale: Lambda has 512 MB of `/tmp`, which must hold all inputs plus
+the merged output (~2× total), so 2 × 200 = 400 MB stays inside budget
+with headroom; the 300 s timeout bounds the 20-file default. All three
+are env-overridable. The output is implicitly bounded by the total
+(merged size ≈ sum of inputs).
+
+## Merge validation & errors
+
+Every input is checked before it reaches the merger: `.pdf` extension
+(case-insensitive), per-file size (HeadObject upfront + post-download),
+`%PDF-` magic bytes, non-empty page count, not encrypted. The first
+invalid input fails the whole request — merging a silent subset would
+break the ordering guarantee.
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"merge", "output_key": ..., "reason": ...}`. Covered failures: no inputs,
+single input, too many files, invalid/non-PDF input, missing or
+inaccessible S3 object, oversized file/total, merge failure, manifest
+download failure, output upload failure. Reasons are user-safe strings;
+tracebacks go to CloudWatch only.
+
+## Merge output naming
+
+`merged-<safe-basename>.pdf`, flat in the output bucket (no folder
+prefix), e.g. `output_name: "Q3 Report.pdf"` →
+`merged-Q3 Report.pdf`.
+
+Sanitization: directory components are dropped (no path traversal —
+`"../../etc/passwd.pdf"` → `merged-passwd.pdf`), control characters
+stripped, `.pdf` extension enforced, spaces/parens/brackets/`&`/unicode
+preserved so the frontend polls the exact key. Empty unusable names fall
+back to the manifest id (`merge-requests/<id>.merge.json` →
+`merged-<id>.pdf`).
 
 ## Filename Handling
 
@@ -100,6 +219,8 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 | `INPUT_BUCKET` | yes | — | event source bucket |
 | `OUTPUT_BUCKET` | yes | — | compressed output bucket |
 | `MAX_FILE_SIZE_MB` | no | `100` | input size cap |
+| `MERGE_MAX_FILES` | no | `20` | max PDFs per merge request |
+| `MERGE_MAX_TOTAL_MB` | no | `200` | max combined merge input size (MB) |
 | `TMP_DIR` | no | system temp | temp workdir base |
 | `GHOSTSCRIPT_BIN` | no | `gs` | gs binary override (tests/CI) |
 | `S3_ENDPOINT_URL` | no | — | S3-compatible endpoint override (local dev) |
@@ -107,27 +228,31 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 48 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 94 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
-  src/operations/compress.py src/common/*.py
+  src/operations/compress.py src/operations/merge.py src/common/*.py
 ```
 
 Covers: key decoding (spaces/parens/brackets/`+`/`&`/unicode/`%`), `.pdf` case
 variants, output naming, multi-record + dedupe + batch isolation, invalid and
 oversized input, temp-dir isolation/cleanup, config defaults/validation,
-entry-point success/error shape.
+entry-point success/error shape, plus merge: 2-file and 4-file merges, order
+preservation, special/unicode/URL-encoded filenames, invalid/missing/oversize
+inputs, count + total-size limits, per-request temp cleanup, output-name
+sanitization, manifest routing, merge config defaults.
 
 ## Docker
 
 Base `public.ecr.aws/lambda/python:3.12` (x86_64) + `ghostscript` via `dnf`,
-`boto3` via pip, `CMD ["app.lambda_handler"]`. Unchanged from the proven
-working image except the trimmed `requirements.txt`.
+`boto3` + `pypdf` via pip, `CMD ["app.lambda_handler"]`. pypdf (pure Python,
+maintained) does merge concatenation; Ghostscript settings are untouched.
 
 ## Future Architecture
 
-`src/operations/` will host `merge.py`, `split.py`, `rotate.py`, `extract.py`,
-`convert.py`, `watermark.py`, `protect.py`, plus editor flattening — each
-reusing `common/` (s3, filenames, validation, cleanup). Claimed by no code yet.
+`src/operations/` now hosts `compress.py` and `merge.py`. Future `split.py`,
+`rotate.py`, `extract.py`, `convert.py`, `watermark.py`, `protect.py`, plus
+editor flattening follow the same pattern, reusing `common/` (s3, filenames,
+validation, cleanup) — multi-file ones reuse the manifest-request pattern.
 
 ## Cost
 
