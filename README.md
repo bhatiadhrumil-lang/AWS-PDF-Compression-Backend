@@ -1,10 +1,9 @@
 # AWS PDF Processing Backend
 
 Official backend source of truth for the PDF platform's server-side processing.
-Today: **PDF compression**, **PDF merge**, **PDF split**, and **PDF rotate**
-— all four implemented, deployed, and verified end-to-end on AWS — plus
-**Delete Pages** (implemented, tested, not yet deployed). More operations
-will plug into `src/operations/` later.
+Today: **PDF compression**, **PDF merge**, **PDF split**, **PDF rotate**,
+and **Delete Pages** — all five implemented, deployed, and verified
+end-to-end on AWS. More operations will plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
 > tags, no versioned paths. The frontend repo is separate and untouched.
@@ -34,6 +33,11 @@ S3 input bucket  (ObjectCreated)
        → src/handler.py :: process_rotate_record
        → pypdf rotate in src/operations/rotate.py (90 | 180 | 270)
        → S3 output bucket (rotate/<request-id>/<stem>-rotated.pdf)
+ └── *.delete.json     (DeletePDF notification, prefix delete-requests/)
+       → same Lambda `pdf-compressor`
+       → src/handler.py :: process_delete_record
+       → pypdf delete in src/operations/delete_pages.py (remove listed pages)
+       → S3 output bucket (delete/<request-id>/<stem>-deleted.pdf)
 → frontend polls HeadObject, downloads via presigned URL
 ```
 
@@ -78,14 +82,15 @@ digest for rollback (e.g. pre-merge image
   role `pdf-compressor-lambda-role`, env `INPUT_BUCKET` /
   `OUTPUT_BUCKET` only).
 * ECR: `868942372673.dkr.ecr.us-east-2.amazonaws.com/pdf-compressor:latest`
-  (currently the rotate image
-  `sha256:28aec245cd3994cf2ec59f61998c46591f3a3d2710ffb0f6c635ec1d3d9324a2`;
+  (currently the delete-pages image
+  `sha256:c0eefc345f5f73f5c40a1b103f55f5ddf710596450cc9dabda68eeba1c4a0e7a`;
   Lambda `CodeSha256` confirms it).
-* Input bucket: `pdf-compressor-input-868942372673` with four notifications
+* Input bucket: `pdf-compressor-input-868942372673` with five notifications
   on the same Lambda: `CompressPDF` (`ObjectCreated:*`, suffix `.pdf`),
   `MergePDF` (`ObjectCreated:*`, suffix `.merge.json`), `SplitPDF`
-  (`ObjectCreated:*`, suffix `.split.json`), and `RotatePDF`
-  (`ObjectCreated:*`, suffix `.rotate.json`).
+  (`ObjectCreated:*`, suffix `.split.json`), `RotatePDF`
+  (`ObjectCreated:*`, suffix `.rotate.json`), and `DeletePDF`
+  (`ObjectCreated:*`, suffix `.delete.json`).
 * Output bucket: `pdf-compressor-output-868942372673`.
 * Lambda execution role (`S3Access` inline): Get/List on the input bucket,
   Put on the output bucket — already covers manifests + merge inputs, so no
@@ -104,8 +109,9 @@ digest for rollback (e.g. pre-merge image
 * Triggers: S3 `ObjectCreated:*` with `.pdf` suffix filter → Lambda
   (compression), `ObjectCreated:*` with `.merge.json` suffix filter →
   same Lambda (merge), `ObjectCreated:*` with `.split.json` suffix filter →
-  same Lambda (split), and `ObjectCreated:*` with `.rotate.json` suffix
-  filter → same Lambda (rotate).
+  same Lambda (split), `ObjectCreated:*` with `.rotate.json` suffix
+  filter → same Lambda (rotate), and `ObjectCreated:*` with `.delete.json`
+  suffix filter → same Lambda (delete).
 * The handler accepts `.pdf` / `.PDF` / `.Pdf` (case-insensitive) even though
   the bucket filter itself is case-sensitive.
 
@@ -163,9 +169,10 @@ source size reuses `MAX_FILE_SIZE_MB`; page selection reuses the
 
 ### Delete Pages
 
-Status: Backend implemented + local/docker-tested, **NOT deployed**
-(no `.delete.json` S3 trigger configured yet; Lambda still runs the
-pre-delete image).
+Status: Backend implemented + deployed + verified end-to-end on AWS
+(delete 2,4 → pages 1,3,5; delete 1-4 → only page 5; every-page deletion
+rejected with no output; compress + merge + split + rotate regressions
+green).
 
 Single-file, single-output operation: one source PDF + manifest →
 one `delete/<request-id>/<stem>-deleted.pdf`. The manifest lists the pages
@@ -232,11 +239,12 @@ batch operations.
 
 Handler routing: `process_record` sends `*.merge.json` keys to
 `process_merge_record`, `*.split.json` keys to `process_split_record`,
-and `*.pdf` keys to the untouched compress
-pipeline; anything else is skipped. A merge/split manifest never enters the
-compress path (it is not a `.pdf`) and PDFs never enter the merge/split path.
-`*.rotate.json` manifests are routed to `process_rotate_record` the same way
-(S3 `RotatePDF` suffix trigger active).
+`*.rotate.json` keys to `process_rotate_record`, `*.delete.json` keys to
+`process_delete_record`, and `*.pdf` keys to the untouched compress
+pipeline; anything else is skipped. Manifests never enter the
+compress path (they are not `.pdf` files) and PDFs never enter the
+operation paths (S3 `CompressPDF`/`MergePDF`/`SplitPDF`/`RotatePDF`/
+`DeletePDF` suffix triggers all active).
 
 ## Split request contract
 Manifest `split-requests/<request-id>.split.json`, uploaded AFTER the
