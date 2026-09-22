@@ -1,0 +1,63 @@
+# AWS CodeBuild buildspec — PDF Compression Backend.
+#
+# Pipeline design:
+#   GitHub (main) -> CodePipeline -> CodeBuild (this file) -> tests ->
+#   Docker build (pdf-compressor:latest, local only) -> [later: ECR push -> Lambda]
+#
+# Project requirements (set on the CodeBuild project, not here):
+#   * Linux image: aws/codebuild/amazonlinux2-x86_64-standard:5.0 (or newer 3.x
+#     standard with Python 3.11+ and Docker 20+).
+#   * Privileged mode: ON (docker build needs the Docker daemon).
+#   * No AWS credentials needed for the test stage (all AWS calls mocked).
+#
+# This buildspec deliberately does NOT push to ECR or touch Lambda.
+# Deployment stays manual until the pipeline's deploy stage is approved.
+version: 0.2
+
+env:
+  variables:
+    IMAGE_TAG: "latest"
+    IMAGE_REPO: "pdf-compressor"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - python3 --version
+      - docker --version
+      # Install runtime deps so the FULL suite runs (pypdf-gated tests
+      # would otherwise skip and the build would under-test the code).
+      - python3 -m pip install --upgrade pip
+      - python3 -m pip install -r requirements.txt
+
+  pre_build:
+    commands:
+      - echo "Running backend unit tests..."
+      - python3 -m unittest discover -s tests -v
+      - echo "Running Python syntax checks..."
+      - >-
+        python3 -m py_compile src/app.py src/handler.py src/config.py
+        src/operations/compress.py src/operations/merge.py
+        src/operations/split.py src/operations/rotate.py
+        src/operations/delete_pages.py src/common/*.py
+      - echo "Tests and syntax checks passed."
+
+  build:
+    commands:
+      - echo "Building Docker image ${IMAGE_REPO}:${IMAGE_TAG} (local only, no push)..."
+      - docker build -t "${IMAGE_REPO}:${IMAGE_TAG}" .
+      - docker images "${IMAGE_REPO}:${IMAGE_TAG}"
+      # Smoke test: the image must contain the operations and shared parser.
+      - >-
+        docker run --rm --entrypoint python "${IMAGE_REPO}:${IMAGE_TAG}" -c
+        "from operations import compress, merge, split, rotate, delete_pages;
+        from common import page_ranges, filenames;
+        from common.filenames import delete_output_key_for;
+        print(delete_output_key_for('doc', 'delete-requests/req-1.delete.json'));
+        print('IMAGE-SMOKE-OK')"
+      - echo "Docker build and smoke test passed."
+
+  post_build:
+    commands:
+      - echo "Backend CI build complete. No ECR push, no Lambda update (manual deploy only)."
