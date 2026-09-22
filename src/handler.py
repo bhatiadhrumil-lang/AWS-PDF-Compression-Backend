@@ -10,10 +10,13 @@ import traceback
 from common import s3 as s3_client
 from common.cleanup import temp_workdir
 from common.filenames import (
+    DELETE_MANIFEST_SUFFIX,
     ROTATE_MANIFEST_SUFFIX,
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
+    delete_output_key_for,
     has_pdf_extension,
+    is_delete_manifest_key,
     is_merge_manifest_key,
     is_rotate_manifest_key,
     is_split_manifest_key,
@@ -54,6 +57,14 @@ from operations.rotate import (
     rotate_pdf,
     validate_rotate_input_key,
 )
+from operations.delete_pages import (
+    DeleteError,
+    load_delete_request,
+    page_count_of as delete_page_count_of,
+    resolve_deletion,
+    delete_pdf_pages,
+    validate_delete_input_key,
+)
 
 
 def _record_bucket_key(record):
@@ -86,6 +97,8 @@ def process_record(record, cfg=None):
         return process_split_record(bucket, key, cfg)
     if is_rotate_manifest_key(key):
         return process_rotate_record(bucket, key, cfg)
+    if is_delete_manifest_key(key):
+        return process_delete_record(bucket, key, cfg)
     if not has_pdf_extension(key):
         return skipped("not a .pdf object")
 
@@ -410,6 +423,97 @@ def process_rotate_record(bucket, manifest_key, cfg=None):
 
     print("Rotate done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "rotate",
+            "output_key": out_key}
+
+
+def process_delete_record(bucket, manifest_key, cfg=None):
+    """Process one delete-request manifest. Returns a result dict (never raises).
+
+    Downloads the manifest, then the single source PDF, into a unique temp
+    workdir (removed on success and failure), validates, deletes the
+    selected pages, and uploads a single
+    "delete/<request-id>/<stem>-deleted.pdf" object. Deleting every page is
+    rejected — a zero-page PDF is never produced.
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("DELETE FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "delete", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-delete-") as workdir:
+            manifest_file = os.path.join(workdir, "request.delete.json")
+            print("Downloading delete request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download delete request: %s" % exc)
+            try:
+                request = load_delete_request(manifest_file)
+            except DeleteError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            try:
+                validate_delete_input_key(source_key)
+            except DeleteError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading delete input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_count = delete_page_count_of(local_input, source_key)
+            except DeleteError as exc:
+                return failed(str(exc))
+
+            try:
+                # Reuses the split range cap: deletion is lightweight, so
+                # no new knob — the cap is about manifest sanity.
+                doomed = resolve_deletion(
+                    request["pages"], page_count, cfg.split_max_ranges)
+            except DeleteError as exc:
+                return failed(str(exc))
+
+            stem = (sanitize_split_stem(request["output_name"])
+                    or sanitize_split_stem(
+                        request_id_from_manifest(
+                            manifest_key, DELETE_MANIFEST_SUFFIX))
+                    or "document")
+            deleted_file = os.path.join(workdir, "deleted.pdf")
+            print("Deleting %d page(s) of %d for manifest=%r"
+                  % (len(doomed), page_count, manifest_key))
+            try:
+                delete_pdf_pages(local_input, source_key, doomed, deleted_file)
+            except DeleteError as exc:
+                return failed(str(exc))
+
+            out_key = delete_output_key_for(request["output_name"], manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(deleted_file, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload edited PDF: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("Delete done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "delete",
             "output_key": out_key}
 
 

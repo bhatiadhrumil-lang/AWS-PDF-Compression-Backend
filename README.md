@@ -2,8 +2,9 @@
 
 Official backend source of truth for the PDF platform's server-side processing.
 Today: **PDF compression**, **PDF merge**, **PDF split**, and **PDF rotate**
-— all four implemented, deployed, and verified end-to-end on AWS. More
-operations will plug into `src/operations/` later.
+— all four implemented, deployed, and verified end-to-end on AWS — plus
+**Delete Pages** (implemented, tested, not yet deployed). More operations
+will plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
 > tags, no versioned paths. The frontend repo is separate and untouched.
@@ -46,10 +47,11 @@ src/
     merge.py             pypdf merge (multi-file -> one output)
     split.py             pypdf split (one input -> ZIP of PDFs)
     rotate.py            pypdf rotate (one input -> one rotated PDF)
+    delete_pages.py      pypdf delete-pages (one input -> one trimmed PDF)
   common/
     s3.py                head/download/upload (lazy boto3 import)
     filenames.py         key decoding, .pdf detection, output naming
-    page_ranges.py       shared page-range parser (split + rotate)
+    page_ranges.py       shared page-range parser (split + rotate + delete)
     validation.py        size limits, %PDF- magic check
     cleanup.py           per-record temp workdirs
 tests/                   stdlib unittest, all AWS calls mocked
@@ -158,6 +160,20 @@ overlaps). Unselected pages pass through untouched; order, count, and
 metadata are preserved (pypdf `/Rotate`, no rasterization). No new limits:
 source size reuses `MAX_FILE_SIZE_MB`; page selection reuses the
 `SPLIT_MAX_RANGES` cap.
+
+### Delete Pages
+
+Status: Backend implemented + local/docker-tested, **NOT deployed**
+(no `.delete.json` S3 trigger configured yet; Lambda still runs the
+pre-delete image).
+
+Single-file, single-output operation: one source PDF + manifest →
+one `delete/<request-id>/<stem>-deleted.pdf`. The manifest lists the pages
+to REMOVE via the shared range syntax (`["2-4", "7"]`, same validation as
+split/rotate). Remaining pages keep order, content, and metadata (pypdf,
+no rasterization). Deleting every page is rejected — a zero-page PDF is
+never produced. No new limits: source size reuses `MAX_FILE_SIZE_MB`;
+page selection reuses the `SPLIT_MAX_RANGES` cap.
 
 ## Single-file vs multi-file operations
 
@@ -324,6 +340,42 @@ pages, output failure, upload failure. User-safe reasons; tracebacks to
 CloudWatch only. No new limits or env vars: rotation reuses
 `MAX_FILE_SIZE_MB` and the `SPLIT_MAX_RANGES` cap.
 
+## Delete request contract
+
+Manifest `delete-requests/<request-id>.delete.json`, uploaded AFTER the
+source PDF (same input bucket):
+
+```json
+{ "operation": "delete", "input": "uploads/<request-id>/document.pdf",
+  "pages": ["2-4", "7"], "output_name": "document" }
+```
+
+* `operation` optional (`.delete.json` suffix implies delete; if present
+  must equal `"delete"`).
+* `input` (required): one plain (decoded) S3 key, same bucket; URL-encoded
+  accepted. Same `.pdf`/size/`%PDF-`/non-empty/not-encrypted checks as
+  split/rotate inputs.
+* `pages` (required, non-empty): list of `"5"` / `"1-3"` tokens naming the
+  pages to REMOVE, parsed by the shared `common.page_ranges` module —
+  identical validation to split/rotate (whitespace tolerated; rejects 0,
+  negatives, empty, malformed, reversed, out-of-bounds,
+  duplicate/overlapping ranges, and more than `SPLIT_MAX_RANGES` ranges).
+  Additionally, deleting every page is rejected with a clear error — a
+  zero-page PDF is never produced. Survivors keep order, content, and
+  metadata.
+* `output_name` (optional stem): same sanitization as split/rotate; falls
+  back to the request id.
+
+Output: one PDF at `delete/<request-id>/<stem>-deleted.pdf` (request id
+always embedded — the frontend polls this EXACT key).
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"delete", "output_key": ..., "reason": ...}`. Covered failures: missing /
+malformed manifest, wrong operation, missing input key or S3 object,
+invalid/encrypted PDF, invalid/out-of-bounds/overlapping pages, deleting
+all pages, output failure, upload failure. User-safe reasons; tracebacks to
+CloudWatch only. No new limits or env vars.
+
 ## Merge limits
 
 | Variable | Default | Purpose |
@@ -417,10 +469,11 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 223 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 277 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
-  src/operations/split.py src/operations/rotate.py src/common/*.py
+  src/operations/split.py src/operations/rotate.py \
+  src/operations/delete_pages.py src/common/*.py
 ```
 
 Covers: key decoding (spaces/parens/brackets/`+`/`&`/unicode/`%`), `.pdf` case
@@ -437,7 +490,11 @@ inputs, ZIP contents and part validity, cleanup, split routing and config,
 plus rotate: 90/180/270 all-pages and selected pages/ranges, selected vs
 unselected verification, order/count/content/metadata preservation, rotation
 rejects (0/360/45/negative/string/float/bool), shared-parser rejects,
-traversal/special filenames, invalid/missing inputs, cleanup, rotate routing.
+traversal/special filenames, invalid/missing inputs, cleanup, rotate routing,
+plus delete: first/middle/last/multi/range/multi-range deletion, order/
+count/content/metadata preservation, all-but-one, every-page and one-page
+rejections, shared-parser rejects, traversal/special filenames,
+invalid/missing inputs, cleanup, delete routing.
 
 ## Docker
 
@@ -447,8 +504,8 @@ maintained) does merge concatenation; Ghostscript settings are untouched.
 
 ## Future Architecture
 
-`src/operations/` now hosts `compress.py`, `merge.py`, `split.py`, and
-`rotate.py`. Future `extract.py`, `convert.py`, `watermark.py`, `protect.py`,
+`src/operations/` now hosts `compress.py`, `merge.py`, `split.py`,
+`rotate.py`, and `delete_pages.py`. Future `extract.py`, `convert.py`,
 plus editor flattening follow the same pattern, reusing `common/` (s3,
 filenames, validation, cleanup) — parameterized ones reuse the
 manifest-request pattern.

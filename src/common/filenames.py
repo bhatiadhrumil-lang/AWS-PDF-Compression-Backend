@@ -17,6 +17,8 @@ SPLIT_MANIFEST_SUFFIX = ".split.json"
 SPLIT_OUTPUT_DIR = "split"
 ROTATE_MANIFEST_SUFFIX = ".rotate.json"
 ROTATE_OUTPUT_DIR = "rotate"
+DELETE_MANIFEST_SUFFIX = ".delete.json"
+DELETE_OUTPUT_DIR = "delete"
 MAX_OUTPUT_BASENAME_LEN = 200
 
 
@@ -72,6 +74,15 @@ def is_rotate_manifest_key(decoded_key):
     routed to the rotate operation instead of compression.
     """
     return str(decoded_key).lower().endswith(ROTATE_MANIFEST_SUFFIX)
+
+
+def is_delete_manifest_key(decoded_key):
+    """True if the key is a delete-request manifest (case-insensitive).
+
+    Manifests live under e.g. "delete-requests/<id>.delete.json" and are
+    routed to the delete operation instead of compression.
+    """
+    return str(decoded_key).lower().endswith(DELETE_MANIFEST_SUFFIX)
 
 
 def request_id_from_manifest(manifest_key, suffix):
@@ -194,3 +205,24 @@ def rotate_output_key_for(output_name, manifest_key=""):
         pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-rotated.pdf")]
                     + "-rotated.pdf")
     return "%s/%s/%s" % (ROTATE_OUTPUT_DIR, request_id, pdf_name)
+
+
+def delete_output_key_for(output_name, manifest_key=""):
+    """Build the deleted-pages PDF output key: "delete/<id>/<stem>-deleted.pdf".
+
+    <id> comes from the manifest basename ("<id>.delete.json"); if the
+    manifest is oddly shaped the id segment falls back to "request".
+    The stem falls back to the id (or "document"). The key always embeds
+    the request id, so the frontend can poll this EXACT key and concurrent
+    users can never collide.
+    """
+    request_id = sanitize_split_stem(
+        request_id_from_manifest(manifest_key, DELETE_MANIFEST_SUFFIX))
+    if not request_id:
+        request_id = "request"
+    stem = sanitize_split_stem(output_name) or request_id
+    pdf_name = "%s-deleted.pdf" % stem
+    if len(pdf_name) > MAX_OUTPUT_BASENAME_LEN:
+        pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-deleted.pdf")]
+                    + "-deleted.pdf")
+    return "%s/%s/%s" % (DELETE_OUTPUT_DIR, request_id, pdf_name)
