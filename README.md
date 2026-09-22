@@ -1,9 +1,9 @@
 # AWS PDF Processing Backend
 
 Official backend source of truth for the PDF platform's server-side processing.
-Today: **PDF compression**, **PDF merge** (both deployed), and **PDF split**
-(implemented, tested, not yet deployed). More operations will plug into
-`src/operations/` later.
+Today: **PDF compression**, **PDF merge**, and **PDF split** — all three
+implemented, deployed, and verified end-to-end on AWS. More operations will
+plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
 > tags, no versioned paths. The frontend repo is separate and untouched.
@@ -23,6 +23,11 @@ S3 input bucket  (ObjectCreated)
        → src/handler.py :: process_merge_record
        → pypdf merge in src/operations/merge.py (inputs in manifest order)
        → S3 output bucket (merged-<name>.pdf)
+ └── *.split.json      (SplitPDF notification, prefix split-requests/)
+       → same Lambda `pdf-compressor`
+       → src/handler.py :: process_split_record
+       → pypdf split in src/operations/split.py (all | ranges)
+       → S3 output bucket (split/<request-id>/<stem>-split.zip)
 → frontend polls HeadObject, downloads via presigned URL
 ```
 
@@ -63,10 +68,14 @@ digest for rollback (e.g. pre-merge image
 * Lambda: `pdf-compressor` (Image/x86_64, 1024 MB, 300 s, 512 MB `/tmp`,
   role `pdf-compressor-lambda-role`, env `INPUT_BUCKET` /
   `OUTPUT_BUCKET` only).
-* ECR: `868942372673.dkr.ecr.us-east-2.amazonaws.com/pdf-compressor:latest`.
-* Input bucket: `pdf-compressor-input-868942372673` with two notifications
-  on the same Lambda: `CompressPDF` (`ObjectCreated:*`, suffix `.pdf`) and
-  `MergePDF` (`ObjectCreated:*`, suffix `.merge.json`).
+* ECR: `868942372673.dkr.ecr.us-east-2.amazonaws.com/pdf-compressor:latest`
+  (currently the split image
+  `sha256:49809a4ec746e3a87df4245fe0a361f8f7ef6a65de5474fff844e2f1e845d343`;
+  Lambda `CodeSha256` confirms it).
+* Input bucket: `pdf-compressor-input-868942372673` with three notifications
+  on the same Lambda: `CompressPDF` (`ObjectCreated:*`, suffix `.pdf`),
+  `MergePDF` (`ObjectCreated:*`, suffix `.merge.json`), and `SplitPDF`
+  (`ObjectCreated:*`, suffix `.split.json`).
 * Output bucket: `pdf-compressor-output-868942372673`.
 * Lambda execution role (`S3Access` inline): Get/List on the input bucket,
   Put on the output bucket — already covers manifests + merge inputs, so no
@@ -83,8 +92,9 @@ digest for rollback (e.g. pre-merge image
 
 * Bucket: `pdf-compressor-input-868942372673` (env `INPUT_BUCKET`).
 * Triggers: S3 `ObjectCreated:*` with `.pdf` suffix filter → Lambda
-  (compression), and `ObjectCreated:*` with `.merge.json` suffix filter →
-  same Lambda (merge).
+  (compression), `ObjectCreated:*` with `.merge.json` suffix filter →
+  same Lambda (merge), and `ObjectCreated:*` with `.split.json` suffix
+  filter → same Lambda (split).
 * The handler accepts `.pdf` / `.PDF` / `.Pdf` (case-insensitive) even though
   the bucket filter itself is case-sensitive.
 
@@ -114,9 +124,9 @@ output, merged with pypdf in exactly the requested order.
 
 ### Split PDF
 
-Status: Backend implemented + local/docker-tested, **NOT deployed**
-(no `.split.json` S3 trigger configured yet; Lambda still runs the
-pre-split image).
+Status: Backend implemented + deployed + verified end-to-end on AWS
+(split-all and ranges modes, ZIP contents validated, compress + merge
+regressions green).
 
 Single-file, multi-output operation: one source PDF + manifest →
 one `split/<request-id>/<stem>-split.zip` containing the requested parts.
