@@ -10,13 +10,19 @@ plug into `src/operations/` later.
 ## Architecture
 
 ```text
-S3 input bucket  (ObjectCreated, *.pdf)
-  → Lambda `pdf-compressor` (container image :latest, 1024 MB, 300 s, us-east-2)
-  → src/app.py :: lambda_handler
-  → src/handler.py :: per-record pipeline
-  → Ghostscript (pdfwrite, /ebook) in src/operations/compress.py
-  → S3 output bucket
-  → frontend polls HeadObject, downloads via presigned URL
+S3 input bucket  (ObjectCreated)
+ ├── *.pdf             (CompressPDF notification)
+ │     → Lambda `pdf-compressor` (container image :latest, 1024 MB, 300 s, us-east-2)
+ │     → src/app.py :: lambda_handler
+ │     → src/handler.py :: per-record pipeline
+ │     → Ghostscript (pdfwrite, /ebook) in src/operations/compress.py
+ │     → S3 output bucket (compressed-<basename>)
+ └── *.merge.json      (MergePDF notification, prefix merge-requests/)
+       → same Lambda `pdf-compressor`
+       → src/handler.py :: process_merge_record
+       → pypdf merge in src/operations/merge.py (inputs in manifest order)
+       → S3 output bucket (merged-<name>.pdf)
+→ frontend polls HeadObject, downloads via presigned URL
 ```
 
 ```text
@@ -43,13 +49,40 @@ requirements.txt         boto3 + pypdf
 
 ## ECR
 
-`pdf-compressor:latest`. Build/push is manual for now — **do not deploy from
-this task**; deployment happens after review.
+`pdf-compressor:latest` (repository `pdf-compressor`, x86_64, us-east-2).
+Lambda runs the `:latest` image by digest; after pushing a new `:latest`,
+update the function code and confirm `CodeSha256` matches the new digest —
+`latest` does not auto-deploy. The previous image stays addressable by its
+digest for rollback (e.g. pre-merge image
+`sha256:13904bef51b69b993ee4ae0abb3f0d103edf6ee5520b9b5b8b1527247e31b099`).
+
+## Deployed resources (us-east-2, account 868942372673)
+
+* Lambda: `pdf-compressor` (Image/x86_64, 1024 MB, 300 s, 512 MB `/tmp`,
+  role `pdf-compressor-lambda-role`, env `INPUT_BUCKET` /
+  `OUTPUT_BUCKET` only).
+* ECR: `868942372673.dkr.ecr.us-east-2.amazonaws.com/pdf-compressor:latest`.
+* Input bucket: `pdf-compressor-input-868942372673` with two notifications
+  on the same Lambda: `CompressPDF` (`ObjectCreated:*`, suffix `.pdf`) and
+  `MergePDF` (`ObjectCreated:*`, suffix `.merge.json`).
+* Output bucket: `pdf-compressor-output-868942372673`.
+* Lambda execution role (`S3Access` inline): Get/List on the input bucket,
+  Put on the output bucket — already covers manifests + merge inputs, so no
+  IAM change was needed for merge. S3→Lambda invoke permission is
+  bucket-scoped, so the new notification needed no permission change either.
+* Memory headroom: a 3-file merge peaked at ~136 MB of 1024 MB; no memory,
+  timeout, or storage changes were required.
+* Cognito guest roles (`Cognito_pdf-compressor-identity-poolUnauth_Role`,
+  `PDFCompressorGuestRole`): `PutObject` on `input-bucket/*` (covers
+  `uploads/*` and `merge-requests/*`) + Get/List on the output bucket —
+  compatible with the frontend merge flow, no change needed.
 
 ## Input
 
 * Bucket: `pdf-compressor-input-868942372673` (env `INPUT_BUCKET`).
-* Trigger: S3 `ObjectCreated:*` with `.pdf` suffix filter → Lambda.
+* Triggers: S3 `ObjectCreated:*` with `.pdf` suffix filter → Lambda
+  (compression), and `ObjectCreated:*` with `.merge.json` suffix filter →
+  same Lambda (merge).
 * The handler accepts `.pdf` / `.PDF` / `.Pdf` (case-insensitive) even though
   the bucket filter itself is case-sensitive.
 
@@ -126,11 +159,11 @@ Input contract details:
 * Ordering is guaranteed: pages appear as A then B then C; nothing is
   sorted or reordered.
 
-Infra note: the bucket trigger must additionally fire on the manifest
-suffix — add an S3 `ObjectCreated:*` notification with suffix
-`.merge.json` (alongside the existing `.pdf` one) pointing at the same
-Lambda. No other infra change is needed. This manifest pattern also fits
-future Split/Rotate/Edit batch operations.
+Infra note (deployed): the input bucket has an S3 `ObjectCreated:*`
+notification with suffix `.merge.json` (`MergePDF`) pointing at the same
+Lambda, alongside the existing `.pdf` one (`CompressPDF`). No other infra
+change was needed. This manifest pattern also fits future Split/Rotate/Edit
+batch operations.
 
 Handler routing: `process_record` sends `*.merge.json` keys to
 `process_merge_record` and `*.pdf` keys to the untouched compress
