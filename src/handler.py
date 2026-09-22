@@ -10,11 +10,16 @@ import traceback
 from common import s3 as s3_client
 from common.cleanup import temp_workdir
 from common.filenames import (
+    SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
     has_pdf_extension,
     is_merge_manifest_key,
+    is_split_manifest_key,
     merged_output_key_for,
     output_key_for,
+    request_id_from_manifest,
+    sanitize_split_stem,
+    split_output_key_for,
 )
 from common.validation import size_ok, validate_local_pdf
 from config import from_env
@@ -27,6 +32,16 @@ from operations.merge import (
     merge_pdfs,
     validate_merge_input_file,
     validate_merge_input_key,
+)
+from operations.split import (
+    SplitError,
+    check_split_output_count,
+    load_split_request,
+    make_split_zip,
+    page_count_of,
+    resolve_ranges,
+    split_pdf,
+    validate_split_input_key,
 )
 
 
@@ -56,6 +71,8 @@ def process_record(record, cfg=None):
         return skipped("missing bucket or key in record")
     if is_merge_manifest_key(key):
         return process_merge_record(bucket, key, cfg)
+    if is_split_manifest_key(key):
+        return process_split_record(bucket, key, cfg)
     if not has_pdf_extension(key):
         return skipped("not a .pdf object")
 
@@ -191,6 +208,106 @@ def process_merge_record(bucket, manifest_key, cfg=None):
 
     print("Merge done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "merge",
+            "output_key": out_key}
+
+
+def process_split_record(bucket, manifest_key, cfg=None):
+    """Process one split-request manifest. Returns a result dict (never raises).
+
+    Downloads the manifest, then the single source PDF, into a unique temp
+    workdir (removed on success and failure), validates, splits per the
+    requested mode, packs the parts flat into one ZIP, and uploads it to
+    "split/<request-id>/<stem>-split.zip".
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("SPLIT FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "split", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-split-") as workdir:
+            manifest_file = os.path.join(workdir, "request.split.json")
+            print("Downloading split request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download split request: %s" % exc)
+            try:
+                request = load_split_request(manifest_file)
+            except SplitError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            try:
+                validate_split_input_key(source_key)
+            except SplitError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading split input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_count = page_count_of(local_input, source_key)
+            except SplitError as exc:
+                return failed(str(exc))
+
+            if request["mode"] == "all":
+                try:
+                    check_split_output_count(page_count, cfg.split_max_outputs)
+                except SplitError as exc:
+                    return failed(str(exc))
+                targets = None
+            else:
+                try:
+                    targets = resolve_ranges(
+                        request["ranges"], page_count, cfg.split_max_ranges)
+                    check_split_output_count(len(targets), cfg.split_max_outputs)
+                except SplitError as exc:
+                    return failed(str(exc))
+
+            stem = (sanitize_split_stem(request["output_name"])
+                    or sanitize_split_stem(
+                        request_id_from_manifest(
+                            manifest_key, SPLIT_MANIFEST_SUFFIX))
+                    or "document")
+            parts_dir = os.path.join(workdir, "parts")
+            os.mkdir(parts_dir)
+            print("Splitting %d page(s) mode=%s for manifest=%r"
+                  % (page_count, request["mode"], manifest_key))
+            try:
+                parts = split_pdf(
+                    local_input, source_key, targets, parts_dir, stem)
+                zip_path = os.path.join(workdir, "split.zip")
+                make_split_zip(parts, zip_path)
+            except SplitError as exc:
+                return failed(str(exc))
+
+            out_key = split_output_key_for(request["output_name"], manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(zip_path, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload split ZIP: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("Split done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "split",
             "output_key": out_key}
 
 
