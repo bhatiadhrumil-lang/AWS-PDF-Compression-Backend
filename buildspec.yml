@@ -1,23 +1,30 @@
 # AWS CodeBuild buildspec — PDF Compression Backend.
 #
-# Pipeline design:
+# Pipeline design (Phase 2A):
 #   GitHub (main) -> CodePipeline -> CodeBuild (this file) -> tests ->
-#   Docker build (pdf-compressor:latest, local only) -> [later: ECR push -> Lambda]
+#   Docker build -> ECR push (latest + commit SHA) -> [later: Lambda update]
 #
 # Project requirements (set on the CodeBuild project, not here):
 #   * Linux image: aws/codebuild/amazonlinux2-x86_64-standard:5.0 (or newer 3.x
 #     standard with Python 3.11+ and Docker 20+).
 #   * Privileged mode: ON (docker build needs the Docker daemon).
 #   * No AWS credentials needed for the test stage (all AWS calls mocked).
+#   * CodeBuild service role needs ECR push rights on the pdf-compressor
+#     repository (ecr:GetAuthorizationToken + Push actions). The role's
+#     temporary credentials are used automatically — no keys in this file.
 #
-# This buildspec deliberately does NOT push to ECR or touch Lambda.
-# Deployment stays manual until the pipeline's deploy stage is approved.
+# This buildspec pushes images to ECR but does NOT touch Lambda.
+# Lambda deployment stays manual until the pipeline's deploy stage is approved.
 version: 0.2
 
 env:
   variables:
     IMAGE_TAG: "latest"
     IMAGE_REPO: "pdf-compressor"
+    # Phase 2A: ECR publishing target. Values are public identifiers
+    # (account ID, region, repo name) — never credentials.
+    AWS_ACCOUNT_ID: "868942372673"
+    AWS_REGION: "us-east-2"
 
 phases:
   install:
@@ -45,7 +52,7 @@ phases:
 
   build:
     commands:
-      - echo "Building Docker image ${IMAGE_REPO}:${IMAGE_TAG} (local only, no push)..."
+      - echo "Building Docker image ${IMAGE_REPO}:${IMAGE_TAG} (ECR push happens in post_build)..."
       - docker build -t "${IMAGE_REPO}:${IMAGE_TAG}" .
       - docker images "${IMAGE_REPO}:${IMAGE_TAG}"
       # Smoke test: the image must contain the operations and shared parser.
@@ -60,4 +67,23 @@ phases:
 
   post_build:
     commands:
-      - echo "Backend CI build complete. No ECR push, no Lambda update (manual deploy only)."
+      # ---- Phase 2A: publish the tested image to Amazon ECR. ----
+      # Auth uses the CodeBuild service role's temporary credentials
+      # (no hard-coded keys). Any failing command below fails the build.
+      - echo "Logging in to Amazon ECR..."
+      - >-
+        aws ecr get-login-password --region "${AWS_REGION}" |
+        docker login --username AWS --password-stdin
+        "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      # Tag the already-built, already-tested local image with both the
+      # floating `latest` tag and the immutable source commit SHA, so a
+      # deployment can always be traced back to exact code.
+      - ': ${CODEBUILD_RESOLVED_SOURCE_VERSION:?CODEBUILD_RESOLVED_SOURCE_VERSION is not set}'
+      - ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO}"
+      - docker tag "${IMAGE_REPO}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
+      - docker tag "${IMAGE_REPO}:${IMAGE_TAG}" "${ECR_URI}:${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+      - echo "Pushing ${ECR_URI}:${IMAGE_TAG} and ${ECR_URI}:${CODEBUILD_RESOLVED_SOURCE_VERSION}..."
+      - docker push "${ECR_URI}:${IMAGE_TAG}"
+      - docker push "${ECR_URI}:${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+      # Lambda is deliberately NOT updated here — that is a later phase.
+      - 'echo "Backend CI complete: tests passed, image pushed to ECR (no Lambda update)."'
