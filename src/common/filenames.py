@@ -19,6 +19,8 @@ ROTATE_MANIFEST_SUFFIX = ".rotate.json"
 ROTATE_OUTPUT_DIR = "rotate"
 DELETE_MANIFEST_SUFFIX = ".delete.json"
 DELETE_OUTPUT_DIR = "delete"
+EDIT_MANIFEST_SUFFIX = ".edit.json"
+EDIT_OUTPUT_DIR = "edit"
 MAX_OUTPUT_BASENAME_LEN = 200
 
 
@@ -83,6 +85,15 @@ def is_delete_manifest_key(decoded_key):
     routed to the delete operation instead of compression.
     """
     return str(decoded_key).lower().endswith(DELETE_MANIFEST_SUFFIX)
+
+
+def is_edit_manifest_key(decoded_key):
+    """True if the key is an edit-request manifest (case-insensitive).
+
+    Manifests live under e.g. "edit-requests/<id>.edit.json" and are
+    routed to the edit operation instead of compression.
+    """
+    return str(decoded_key).lower().endswith(EDIT_MANIFEST_SUFFIX)
 
 
 def request_id_from_manifest(manifest_key, suffix):
@@ -226,3 +237,24 @@ def delete_output_key_for(output_name, manifest_key=""):
         pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-deleted.pdf")]
                     + "-deleted.pdf")
     return "%s/%s/%s" % (DELETE_OUTPUT_DIR, request_id, pdf_name)
+
+
+def edit_output_key_for(output_name, manifest_key=""):
+    """Build the edited PDF output key: "edit/<id>/<stem>-edited.pdf".
+
+    <id> comes from the manifest basename ("<id>.edit.json"); if the
+    manifest is oddly shaped the id segment falls back to "request".
+    The stem falls back to the id (or "document"). The key always embeds
+    the request id, so the frontend can poll this EXACT key and concurrent
+    users can never collide.
+    """
+    request_id = sanitize_split_stem(
+        request_id_from_manifest(manifest_key, EDIT_MANIFEST_SUFFIX))
+    if not request_id:
+        request_id = "request"
+    stem = sanitize_split_stem(output_name) or request_id
+    pdf_name = "%s-edited.pdf" % stem
+    if len(pdf_name) > MAX_OUTPUT_BASENAME_LEN:
+        pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-edited.pdf")]
+                    + "-edited.pdf")
+    return "%s/%s/%s" % (EDIT_OUTPUT_DIR, request_id, pdf_name)

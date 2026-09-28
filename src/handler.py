@@ -15,8 +15,10 @@ from common.filenames import (
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
     delete_output_key_for,
+    edit_output_key_for,
     has_pdf_extension,
     is_delete_manifest_key,
+    is_edit_manifest_key,
     is_merge_manifest_key,
     is_rotate_manifest_key,
     is_split_manifest_key,
@@ -65,6 +67,17 @@ from operations.delete_pages import (
     delete_pdf_pages,
     validate_delete_input_key,
 )
+from operations.edit import (
+    EditError,
+    check_edit_count,
+    collect_image_sources,
+    load_edit_request,
+    page_info_of,
+    render_edited_pdf,
+    resolve_edit_pages,
+    validate_edit_input_key,
+    validate_image_file,
+)
 
 
 def _record_bucket_key(record):
@@ -99,6 +112,8 @@ def process_record(record, cfg=None):
         return process_rotate_record(bucket, key, cfg)
     if is_delete_manifest_key(key):
         return process_delete_record(bucket, key, cfg)
+    if is_edit_manifest_key(key):
+        return process_edit_record(bucket, key, cfg)
     if not has_pdf_extension(key):
         return skipped("not a .pdf object")
 
@@ -514,6 +529,107 @@ def process_delete_record(bucket, manifest_key, cfg=None):
 
     print("Delete done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "delete",
+            "output_key": out_key}
+
+
+def process_edit_record(bucket, manifest_key, cfg=None):
+    """Process one edit-request manifest. Returns a result dict (never raises).
+
+    Downloads the manifest, then the single source PDF plus any referenced
+    overlay images, into a unique temp workdir (removed on success and
+    failure), validates everything, renders the overlays, and uploads a
+    single "edit/<request-id>/<stem>-edited.pdf" object.
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("EDIT FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "edit", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-edit-") as workdir:
+            manifest_file = os.path.join(workdir, "request.edit.json")
+            print("Downloading edit request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download edit request: %s" % exc)
+            try:
+                request = load_edit_request(manifest_file)
+            except EditError as exc:
+                return failed(str(exc))
+            try:
+                check_edit_count(request["edits"], cfg.edit_max_edits)
+            except EditError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            try:
+                validate_edit_input_key(source_key)
+            except EditError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading edit input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_sizes, page_count = page_info_of(local_input, source_key)
+            except EditError as exc:
+                return failed(str(exc))
+            try:
+                grouped = resolve_edit_pages(request["edits"], page_sizes)
+            except EditError as exc:
+                return failed(str(exc))
+
+            image_paths = {}
+            for position, src_key in enumerate(
+                    collect_image_sources(request["edits"])):
+                local_image = os.path.join(workdir, "image-%04d" % position)
+                print("Downloading edit image s3://%s/%s" % (bucket, src_key))
+                try:
+                    s3_client.download_file(bucket, src_key, local_image)
+                except Exception as exc:
+                    return failed("cannot download image %r: %s" % (src_key, exc))
+                try:
+                    validate_image_file(local_image, src_key, cfg.edit_max_image_mb)
+                except EditError as exc:
+                    return failed(str(exc))
+                image_paths[src_key] = local_image
+
+            edited_file = os.path.join(workdir, "edited.pdf")
+            print("Applying %d edit(s) on %d page(s) for manifest=%r"
+                  % (len(request["edits"]), page_count, manifest_key))
+            try:
+                render_edited_pdf(local_input, source_key, grouped,
+                                  image_paths, edited_file)
+            except EditError as exc:
+                return failed(str(exc))
+
+            out_key = edit_output_key_for(request["output_name"], manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(edited_file, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload edited PDF: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("Edit done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "edit",
             "output_key": out_key}
 
 

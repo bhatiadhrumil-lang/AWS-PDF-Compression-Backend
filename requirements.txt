@@ -4,3 +4,6 @@
 # imported anywhere — removed to shrink build time, image size, cold starts.
 boto3
 pypdf
+# reportlab authors overlay content for the edit operation (text, shapes,
+# images); pypdf merges overlays onto original pages. Pure Python.
+reportlab

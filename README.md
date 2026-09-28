@@ -2,8 +2,9 @@
 
 Official backend source of truth for the PDF platform's server-side processing.
 Today: **PDF compression**, **PDF merge**, **PDF split**, **PDF rotate**,
-and **Delete Pages** — all five implemented, deployed, and verified
-end-to-end on AWS. More operations will plug into `src/operations/` later.
+**Delete Pages** — all five implemented, deployed, and verified end-to-end
+on AWS — plus **Edit PDF v1** (implemented, tested, not yet deployed). More
+operations will plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
 > tags, no versioned paths. The frontend repo is separate and untouched.
@@ -38,6 +39,9 @@ S3 input bucket  (ObjectCreated)
        → src/handler.py :: process_delete_record
        → pypdf delete in src/operations/delete_pages.py (remove listed pages)
        → S3 output bucket (delete/<request-id>/<stem>-deleted.pdf)
+ (EditPDF notification `*.edit.json`, prefix edit-requests/ — NOT deployed yet;
+  code routes it to process_edit_record using operations/edit.py → output
+  edit/<request-id>/<stem>-edited.pdf.)
 → frontend polls HeadObject, downloads via presigned URL
 ```
 
@@ -52,6 +56,7 @@ src/
     split.py             pypdf split (one input -> ZIP of PDFs)
     rotate.py            pypdf rotate (one input -> one rotated PDF)
     delete_pages.py      pypdf delete-pages (one input -> one trimmed PDF)
+    edit.py              overlay edits (one input -> one edited PDF, NOT deployed)
   common/
     s3.py                head/download/upload (lazy boto3 import)
     filenames.py         key decoding, .pdf detection, output naming
@@ -60,7 +65,7 @@ src/
     cleanup.py           per-record temp workdirs
 tests/                   stdlib unittest, all AWS calls mocked
 Dockerfile               lambda/python:3.12 + ghostscript (unchanged)
-requirements.txt         boto3 + pypdf
+requirements.txt         boto3 + pypdf + reportlab (reportlab only for edit overlays)
 ```
 
 ## AWS Region
@@ -181,6 +186,26 @@ split/rotate). Remaining pages keep order, content, and metadata (pypdf,
 no rasterization). Deleting every page is rejected — a zero-page PDF is
 never produced. No new limits: source size reuses `MAX_FILE_SIZE_MB`;
 page selection reuses the `SPLIT_MAX_RANGES` cap.
+
+### Edit PDF v1
+
+Status: Backend implemented + local/docker-tested, **NOT deployed**
+(no `.edit.json` S3 trigger configured yet; Lambda still runs the
+pre-edit image).
+
+Single-file, single-output operation: one source PDF + manifest →
+one `edit/<request-id>/<stem>-edited.pdf`. The manifest carries an ordered
+list of overlay edits (schema `version: 1`): `text`, `draw` (freehand
+polyline), `highlight` (translucent rect), `rect` (stroked rectangle), and
+`image` (PNG/JPEG uploaded to the input bucket, referenced by exact S3
+key). Coordinates are PDF points with bottom-left origin (never screen
+pixels); every box/point must fit inside its page. Overlays are vector
+content merged per touched page (reportlab authoring + pypdf merge) — no
+rasterization; original content/order/count/metadata preserved. New limits:
+`EDIT_MAX_EDITS` (200), `EDIT_MAX_IMAGE_MB` (5); source size reuses
+`MAX_FILE_SIZE_MB`. Limitations: overlays apply in unrotated page space
+(pages with `/Rotate` may misalign); Helvetica only; images stretch to the
+given box.
 
 ## Single-file vs multi-file operations
 
@@ -384,6 +409,54 @@ invalid/encrypted PDF, invalid/out-of-bounds/overlapping pages, deleting
 all pages, output failure, upload failure. User-safe reasons; tracebacks to
 CloudWatch only. No new limits or env vars.
 
+## Edit request contract (v1)
+
+Manifest `edit-requests/<request-id>.edit.json`, uploaded AFTER the source
+PDF (same input bucket). Overlay images, if any, are uploaded as separate
+objects (e.g. `uploads/<request-id>/img-0.png`) BEFORE the manifest:
+
+```json
+{ "operation": "edit", "version": 1,
+  "input": "uploads/<request-id>/document.pdf",
+  "output_name": "document",
+  "edits": [
+    {"page": 1, "type": "text", "x": 100, "y": 150,
+     "text": "Hello", "font_size": 16, "color": "#FF0000"},
+    {"page": 1, "type": "highlight", "x": 100, "y": 220,
+     "width": 200, "height": 25, "color": "#FFFF00", "alpha": 0.4}
+  ] }
+```
+
+* `operation` optional (`.edit.json` suffix implies edit; if present must
+  equal `"edit"`). `version` required, must be `1` (only schema in use).
+* `input` (required): exact S3 key, same bucket (verbatim, never decoded).
+  Same `.pdf`/size/`%PDF-`/non-empty/not-encrypted checks as other inputs.
+* `edits` (required, non-empty, max `EDIT_MAX_EDITS`): each has a
+  1-indexed `page` (must exist), a `type`, and type fields:
+  - `text`: `x`, `y`, `text` (1..2000 chars), `font_size` (6..144),
+    `color` (#RRGGBB). Position is the text baseline start.
+  - `draw`: `points` ([[x,y],...], 2..2000), `width` (line, ≤50), `color`.
+  - `highlight`: `x`, `y`, `width`, `height`, `color`, `alpha` (0..1,
+    default 1). Filled translucent rect.
+  - `rect`: same box fields + `border` (default 2, ≤50); filled only when
+    `alpha` < 1.
+  - `image`: `x`, `y`, `width`, `height`, `src` (exact S3 key of a PNG/JPEG
+    ≤ `EDIT_MAX_IMAGE_MB`, validated by magic bytes; stretched to the box).
+* Coordinates are PDF points, origin bottom-left; everything must fit inside
+  the page mediabox or the request fails with a clear error.
+* `output_name` (optional stem): same sanitization as split/rotate/delete;
+  falls back to the request id.
+
+Output: one PDF at `edit/<request-id>/<stem>-edited.pdf` (request id always
+embedded — the frontend polls this EXACT key).
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"edit", "output_key": ..., "reason": ...}`. Covered failures: missing /
+malformed manifest, wrong operation/version, bad edit type/fields,
+out-of-bounds pages or boxes, missing/non-image/oversize overlay images,
+output failure, upload failure. User-safe reasons; tracebacks to CloudWatch
+only.
+
 ## Merge limits
 
 | Variable | Default | Purpose |
@@ -482,6 +555,8 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 | `MERGE_MAX_TOTAL_MB` | no | `200` | max combined merge input size (MB) |
 | `SPLIT_MAX_RANGES` | no | `50` | max page ranges per split request |
 | `SPLIT_MAX_OUTPUTS` | no | `200` | max PDFs generated per split request |
+| `EDIT_MAX_EDITS` | no | `200` | max overlay edits per edit request |
+| `EDIT_MAX_IMAGE_MB` | no | `5` | max MB per embedded edit image |
 | `TMP_DIR` | no | system temp | temp workdir base |
 | `GHOSTSCRIPT_BIN` | no | `gs` | gs binary override (tests/CI) |
 | `S3_ENDPOINT_URL` | no | — | S3-compatible endpoint override (local dev) |
@@ -489,11 +564,11 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 277 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 335 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
   src/operations/split.py src/operations/rotate.py \
-  src/operations/delete_pages.py src/common/*.py
+  src/operations/delete_pages.py src/operations/edit.py src/common/*.py
 ```
 
 Covers: key decoding (spaces/parens/brackets/`+`/`&`/unicode/`%`), `.pdf` case
@@ -514,7 +589,11 @@ traversal/special filenames, invalid/missing inputs, cleanup, rotate routing,
 plus delete: first/middle/last/multi/range/multi-range deletion, order/
 count/content/metadata preservation, all-but-one, every-page and one-page
 rejections, shared-parser rejects, traversal/special filenames,
-invalid/missing inputs, cleanup, delete routing.
+invalid/missing inputs, cleanup, delete routing, plus edit: manifest and
+per-type validation, bad version/type/page/color/size rejects, page-fit
+rejects, image validation, text/highlight/rect/draw/image rendering,
+metadata preservation, special filenames, missing inputs/images, cleanup,
+edit routing and config.
 
 ## Docker
 
