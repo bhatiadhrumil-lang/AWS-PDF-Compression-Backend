@@ -85,5 +85,15 @@ phases:
       - echo "Pushing ${ECR_URI}:${IMAGE_TAG} and ${ECR_URI}:${CODEBUILD_RESOLVED_SOURCE_VERSION}..."
       - docker push "${ECR_URI}:${IMAGE_TAG}"
       - docker push "${ECR_URI}:${CODEBUILD_RESOLVED_SOURCE_VERSION}"
-      # Lambda is deliberately NOT updated here — that is a later phase.
-      - 'echo "Backend CI complete: tests passed, image pushed to ECR (no Lambda update)."'
+
+      # ---- Lambda deployment: update function to the immutable commit image. ----
+      - echo "Updating Lambda function pdf-compressor..."
+      - >-
+        aws lambda update-function-code
+        --function-name pdf-compressor
+        --image-uri "${ECR_URI}:${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+        --region "${AWS_REGION}"
+      - echo "Waiting for Lambda image update to complete..."
+      - aws lambda wait function-updated --function-name pdf-compressor --region "${AWS_REGION}"
+      - echo "Lambda deployment completed successfully."
+      - echo "Backend CI/CD complete: tests passed, image pushed to ECR, Lambda updated."
