@@ -50,7 +50,7 @@ S3 input bucket  (ObjectCreated)
                          operations/jpg_to_pdf.py
                          → output jpg-to-pdf/<request-id>/<name>.pdf)
  └── *.pdf2jpg.json     (PDFToJPG notification, prefix pdf-to-jpg-requests/
-                         — NOT deployed yet; code routes it to
+                         — DEPLOYED; code routes it to
                          process_pdf_to_jpg_record using
                          operations/pdf_to_jpg.py
                          → output pdf-to-jpg/<request-id>/<stem>-page-001.jpg …)
@@ -238,10 +238,9 @@ never modified. New caps `JPG2PDF_MAX_IMAGES` (default 20) and
 
 ### PDF to JPG
 
-Status: Backend implemented + tested, **NOT deployed** (no `.pdf2jpg.json`
-trigger yet; needs the same one-line notification as the other manifest
-operations plus an image rebuild — deployment happens separately, never
-from here).
+Status: Backend implemented + tested + **DEPLOYED** (`.pdf2jpg.json`
+trigger `PDFToJPG` live; Lambda on the pdf_to_jpg image; verified
+end-to-end on AWS with real Ghostscript renders).
 
 Single-file, multi-output operation: one source PDF + manifest → one JPG
 per requested page at `pdf-to-jpg/<request-id>/<stem>-page-001.jpg`
