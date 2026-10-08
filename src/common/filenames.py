@@ -25,6 +25,8 @@ EXTRACT_MANIFEST_SUFFIX = ".extract.json"
 EXTRACT_OUTPUT_DIR = "extract"
 EDIT_MANIFEST_SUFFIX = ".edit.json"
 EDIT_OUTPUT_DIR = "edit"
+PDF2JPG_MANIFEST_SUFFIX = ".pdf2jpg.json"
+PDF2JPG_OUTPUT_DIR = "pdf-to-jpg"
 MAX_OUTPUT_BASENAME_LEN = 200
 
 
@@ -113,6 +115,41 @@ def is_edit_manifest_key(decoded_key):
     routed to the edit operation instead of compression.
     """
     return str(decoded_key).lower().endswith(EDIT_MANIFEST_SUFFIX)
+
+
+def is_pdf_to_jpg_manifest_key(decoded_key):
+    """True if the key is a pdf-to-jpg request manifest (case-insensitive).
+
+    Manifests live under e.g. "pdf-to-jpg-requests/<id>.pdf2jpg.json" and are
+    routed to the pdf_to_jpg operation instead of compression.
+    """
+    return str(decoded_key).lower().endswith(PDF2JPG_MANIFEST_SUFFIX)
+
+
+def pdf_to_jpg_page_key_for(stem, request_id, page_num):
+    """Build one JPG output key: "pdf-to-jpg/<id>/<stem>-page-001.jpg".
+
+    page_num is the ORIGINAL 1-indexed PDF page number (not a sequence
+    index), zero-padded to three digits, so keys sort in page order and the
+    frontend can poll each expected key exactly.
+    """
+    return "%s/%s/%s-page-%03d.jpg" % (
+        PDF2JPG_OUTPUT_DIR, request_id, stem, page_num)
+
+
+def pdf_to_jpg_output_keys_for(output_name, manifest_key, pages):
+    """Build all JPG output keys for a request, in the requested page order.
+
+    The stem falls back to the request id (or "document"), exactly like the
+    other single-input operations.
+    """
+    request_id = sanitize_split_stem(
+        request_id_from_manifest(manifest_key, PDF2JPG_MANIFEST_SUFFIX))
+    if not request_id:
+        request_id = "request"
+    stem = sanitize_split_stem(output_name) or request_id
+    return [pdf_to_jpg_page_key_for(stem, request_id, page)
+            for page in pages]
 
 
 def request_id_from_manifest(manifest_key, suffix):

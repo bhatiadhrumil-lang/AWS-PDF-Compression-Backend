@@ -13,6 +13,7 @@ from common.filenames import (
     DELETE_MANIFEST_SUFFIX,
     EXTRACT_MANIFEST_SUFFIX,
     JPG2PDF_MANIFEST_SUFFIX,
+    PDF2JPG_MANIFEST_SUFFIX,
     ROTATE_MANIFEST_SUFFIX,
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
@@ -25,11 +26,13 @@ from common.filenames import (
     is_extract_manifest_key,
     is_jpg_to_pdf_manifest_key,
     is_merge_manifest_key,
+    is_pdf_to_jpg_manifest_key,
     is_rotate_manifest_key,
     is_split_manifest_key,
     jpg_to_pdf_output_key_for,
     merged_output_key_for,
     output_key_for,
+    pdf_to_jpg_output_keys_for,
     request_id_from_manifest,
     rotate_output_key_for,
     sanitize_split_stem,
@@ -91,6 +94,15 @@ from operations.jpg_to_pdf import (
     load_jpg_to_pdf_request,
     validate_jpg_input_key,
 )
+from operations.pdf_to_jpg import (
+    PdfToJpgError,
+    check_pdf_to_jpg_page_count,
+    load_pdf_to_jpg_request,
+    page_count_of as pdf_to_jpg_page_count_of,
+    render_pdf_pages,
+    resolve_pdf_to_jpg_pages,
+    validate_pdf_to_jpg_input_key,
+)
 from operations.edit import (
     EditError,
     apply_page_ops,
@@ -141,6 +153,8 @@ def process_record(record, cfg=None):
         return process_extract_record(bucket, key, cfg)
     if is_jpg_to_pdf_manifest_key(key):
         return process_jpg_to_pdf_record(bucket, key, cfg)
+    if is_pdf_to_jpg_manifest_key(key):
+        return process_pdf_to_jpg_record(bucket, key, cfg)
     if is_edit_manifest_key(key):
         return process_edit_record(bucket, key, cfg)
     if not has_pdf_extension(key):
@@ -734,6 +748,103 @@ def process_jpg_to_pdf_record(bucket, manifest_key, cfg=None):
     print("JpgToPdf done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "jpg_to_pdf",
             "output_key": out_key}
+
+
+def process_pdf_to_jpg_record(bucket, manifest_key, cfg=None):
+    """Process one pdf-to-jpg request manifest (never raises).
+
+    Downloads the manifest, then the single source PDF, into a unique temp
+    workdir (removed on success and failure), validates, renders each
+    requested page to JPG with Ghostscript, and uploads the images to
+    "pdf-to-jpg/<request-id>/<stem>-page-001.jpg" (one per requested page,
+    in requested order). The source PDF is never modified.
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("PDF2JPG FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "pdf_to_jpg", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-pdf2jpg-") as workdir:
+            manifest_file = os.path.join(workdir, "request.pdf2jpg.json")
+            print("Downloading pdf to jpg request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download pdf to jpg request: %s" % exc)
+            try:
+                request = load_pdf_to_jpg_request(manifest_file)
+            except PdfToJpgError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            try:
+                validate_pdf_to_jpg_input_key(source_key)
+            except PdfToJpgError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading pdf input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_count = pdf_to_jpg_page_count_of(local_input, source_key)
+            except PdfToJpgError as exc:
+                return failed(str(exc))
+            try:
+                pages = resolve_pdf_to_jpg_pages(
+                    request["pages"], page_count, cfg.pdf2jpg_max_pages)
+            except PdfToJpgError as exc:
+                return failed(str(exc))
+
+            stem = (sanitize_split_stem(request["output_name"])
+                    or sanitize_split_stem(
+                        request_id_from_manifest(
+                            manifest_key, PDF2JPG_MANIFEST_SUFFIX))
+                    or "document")
+            pages_dir = os.path.join(workdir, "pages")
+            os.mkdir(pages_dir)
+            print("Rendering %d page(s) for manifest=%r"
+                  % (len(pages), manifest_key))
+            try:
+                rendered = render_pdf_pages(
+                    local_input, source_key, pages, request["quality"],
+                    pages_dir, stem)
+            except PdfToJpgError as exc:
+                return failed(str(exc))
+
+            expected_keys = pdf_to_jpg_output_keys_for(
+                request["output_name"], manifest_key, pages)
+            out_keys = []
+            for out_key, (page_num, local_path) in zip(expected_keys, rendered):
+                print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+                try:
+                    s3_client.upload_file(
+                        local_path, cfg.output_bucket, out_key)
+                except Exception as exc:
+                    return failed(
+                        "cannot upload page %d: %s" % (page_num, exc))
+                out_keys.append(out_key)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("PdfToJpg done manifest=%r -> %d file(s)" % (manifest_key, len(out_keys)))
+    return {"status": "ok", "key": manifest_key, "operation": "pdf_to_jpg",
+            "output_keys": out_keys}
 
 
 def apply_edit_page_ops(local_input, page_ops, workdir, source_key):

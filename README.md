@@ -49,6 +49,11 @@ S3 input bucket  (ObjectCreated)
                          process_jpg_to_pdf_record using
                          operations/jpg_to_pdf.py
                          → output jpg-to-pdf/<request-id>/<name>.pdf)
+ └── *.pdf2jpg.json     (PDFToJPG notification, prefix pdf-to-jpg-requests/
+                         — NOT deployed yet; code routes it to
+                         process_pdf_to_jpg_record using
+                         operations/pdf_to_jpg.py
+                         → output pdf-to-jpg/<request-id>/<stem>-page-001.jpg …)
  (EditPDF notification `*.edit.json`, prefix edit-requests/ — NOT deployed yet;
   code routes it to process_edit_record using operations/edit.py → output
   edit/<request-id>/<stem>-edited.pdf.)
@@ -68,6 +73,7 @@ src/
     delete_pages.py      pypdf delete-pages (one input -> one trimmed PDF)
     extract.py           pypdf extract-pages (one input -> one subset PDF)
     jpg_to_pdf.py        reportlab images-to-PDF (N images -> one PDF)
+    pdf_to_jpg.py        ghostscript PDF pages-to-JPG (one PDF -> N JPGs)
     edit.py              overlay edits (one input -> one edited PDF, NOT deployed)
   common/
     s3.py                head/download/upload (lazy boto3 import)
@@ -229,6 +235,23 @@ quality loss, aspect ratio preserved, pages sized to each image (mixed
 dimensions supported). RGB and grayscale both work. Source images are
 never modified. New caps `JPG2PDF_MAX_IMAGES` (default 20) and
 `JPG2PDF_MAX_TOTAL_MB` (default 200, same /tmp rationale as merge).
+
+### PDF to JPG
+
+Status: Backend implemented + tested, **NOT deployed** (no `.pdf2jpg.json`
+trigger yet; needs the same one-line notification as the other manifest
+operations plus an image rebuild — deployment happens separately, never
+from here).
+
+Single-file, multi-output operation: one source PDF + manifest → one JPG
+per requested page at `pdf-to-jpg/<request-id>/<stem>-page-001.jpg`
+(original page numbers, zero-padded, in requested order). Pages render with
+Ghostscript (already in the Lambda image for compression — no new
+packages) at a fixed 150 DPI with manifest JPEG quality 1-100 (default 85):
+real rasterized JPGs, never renamed PDFs. Page list is explicit ints and/or
+range tokens, validated against the document page count, duplicates
+normalized (first wins) so filenames can never collide. New cap
+`PDF2JPG_MAX_PAGES` (default 50, same timeout rationale as split).
 
 ### Edit PDF (professional editor)
 
@@ -540,6 +563,49 @@ non-JPG extension, oversize images/total, invalid/corrupted image,
 conversion failure, output failure, upload failure. User-safe reasons;
 tracebacks to CloudWatch only.
 
+## PDF to JPG request contract
+
+Manifest `pdf-to-jpg-requests/<request-id>.pdf2jpg.json`, uploaded AFTER
+the source PDF (same input bucket):
+
+```json
+{ "operation": "pdf_to_jpg",
+  "input": "uploads/<request-id>/document.pdf",
+  "pages": [1, 2, 3],
+  "quality": 90,
+  "output_name": "document" }
+```
+
+* `operation` optional (`.pdf2jpg.json` suffix implies pdf_to_jpg; if
+  present must equal `"pdf_to_jpg"`).
+* `input` (required): EXACT S3 key in the same input bucket, used verbatim
+  (never URL-decoded); must name a `.pdf` (any case), must exist, and must
+  pass per-file size (`MAX_FILE_SIZE_MB`), PDF-magic, non-empty, and
+  not-encrypted checks like every other PDF input.
+* `pages` (required, non-empty): explicit 1-indexed page numbers and/or
+  range tokens (`"5-7"`, comma strings split), expanded IN REQUESTED ORDER;
+  duplicates normalized (first wins). Every page must exist
+  (1..page count); total capped at `PDF2JPG_MAX_PAGES` (default 50).
+* `quality` (optional, default 85): integer JPEG quality 1-100, forwarded
+  to Ghostscript (`-dJPEGQ`). Render resolution is a fixed 150 DPI —
+  sharp enough for screen/print preview without huge files.
+* `output_name` (optional stem): same sanitization as split/rotate/delete
+  (no path traversal, spaces/parens/unicode preserved); falls back to the
+  request id.
+
+Output: one JPG per requested page at
+`pdf-to-jpg/<request-id>/<stem>-page-001.jpg` (original page numbers,
+zero-padded, requested order; dedicated namespace, never the jpg-to-pdf
+directory). The frontend polls each exact key.
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"pdf_to_jpg", "output_keys": [...], "reason": ...}`. Covered failures:
+missing / malformed manifest, wrong operation, missing input key or S3
+object, non-PDF extension, oversize input, invalid/corrupted/encrypted
+PDF, invalid page numbers, empty selection, too many pages, invalid
+quality, render failure, upload failure. User-safe reasons; tracebacks to
+CloudWatch only.
+
 ## Edit request contract (v1)
 
 Manifest `edit-requests/<request-id>.edit.json`, uploaded AFTER the source
@@ -711,6 +777,7 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 | `EXTRACT_MAX_PAGES` | no | `500` | max pages copied per extract request |
 | `JPG2PDF_MAX_IMAGES` | no | `20` | max JPEGs per jpg-to-pdf request |
 | `JPG2PDF_MAX_TOTAL_MB` | no | `200` | max combined jpg-to-pdf image size (MB) |
+| `PDF2JPG_MAX_PAGES` | no | `50` | max pages rendered per pdf-to-jpg request |
 | `EDIT_MAX_EDITS` | no | `200` | max overlay edits per edit request |
 | `EDIT_MAX_IMAGE_MB` | no | `5` | max MB per embedded edit image |
 | `TMP_DIR` | no | system temp | temp workdir base |
@@ -720,11 +787,12 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 438 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 487 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
   src/operations/split.py src/operations/rotate.py \
   src/operations/extract.py src/operations/jpg_to_pdf.py \
+  src/operations/pdf_to_jpg.py \
   src/operations/delete_pages.py src/operations/edit.py src/common/*.py
 ```
 

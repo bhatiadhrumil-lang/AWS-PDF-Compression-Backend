@@ -38,6 +38,10 @@ Optional:
   EDIT_MAX_IMAGE_MB max size per embedded edit image in MB (default 5).
                     Rationale: images travel as separate S3 objects and must
                     fit /tmp alongside the input and output.
+  PDF2JPG_MAX_PAGES max pages rendered per pdf-to-jpg request (default 50).
+                    Rationale: each page is a Ghostscript render at 150 DPI;
+                    the cap bounds per-page work, /tmp usage (input plus one
+                    JPG at a time), and the 300 s timeout.
   TMP_DIR           base dir for temp workdirs (default: system temp / /tmp)
 """
 import os
@@ -53,6 +57,7 @@ DEFAULT_SPLIT_MAX_OUTPUTS = 200
 DEFAULT_EXTRACT_MAX_PAGES = 500
 DEFAULT_EDIT_MAX_EDITS = 200
 DEFAULT_EDIT_MAX_IMAGE_MB = 5
+DEFAULT_PDF2JPG_MAX_PAGES = 50
 
 
 def _positive_int(value, default):
@@ -73,7 +78,8 @@ class Config:
                  split_max_outputs=DEFAULT_SPLIT_MAX_OUTPUTS,
                  extract_max_pages=DEFAULT_EXTRACT_MAX_PAGES,
                  edit_max_edits=DEFAULT_EDIT_MAX_EDITS,
-                 edit_max_image_mb=DEFAULT_EDIT_MAX_IMAGE_MB):
+                 edit_max_image_mb=DEFAULT_EDIT_MAX_IMAGE_MB,
+                 pdf2jpg_max_pages=DEFAULT_PDF2JPG_MAX_PAGES):
         self.input_bucket = input_bucket
         self.output_bucket = output_bucket
         self.max_file_size_mb = max_file_size_mb
@@ -87,6 +93,7 @@ class Config:
         self.extract_max_pages = extract_max_pages
         self.edit_max_edits = edit_max_edits
         self.edit_max_image_mb = edit_max_image_mb
+        self.pdf2jpg_max_pages = pdf2jpg_max_pages
 
     def validate(self):
         missing = [
@@ -138,5 +145,8 @@ def from_env(env=None):
         ),
         edit_max_image_mb=_positive_int(
             env.get("EDIT_MAX_IMAGE_MB"), DEFAULT_EDIT_MAX_IMAGE_MB
+        ),
+        pdf2jpg_max_pages=_positive_int(
+            env.get("PDF2JPG_MAX_PAGES"), DEFAULT_PDF2JPG_MAX_PAGES
         ),
     ).validate()

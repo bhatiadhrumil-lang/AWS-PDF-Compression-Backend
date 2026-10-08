@@ -48,7 +48,7 @@ phases:
         src/operations/compress.py src/operations/merge.py
         src/operations/split.py src/operations/rotate.py
         src/operations/delete_pages.py src/operations/extract.py
-        src/operations/edit.py src/operations/jpg_to_pdf.py src/common/*.py
+        src/operations/edit.py src/operations/jpg_to_pdf.py src/operations/pdf_to_jpg.py src/common/*.py
       - echo "Tests and syntax checks passed."
 
   build:
