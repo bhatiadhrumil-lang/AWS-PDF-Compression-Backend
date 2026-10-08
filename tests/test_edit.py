@@ -22,13 +22,18 @@ from config import Config
 from operations.edit import (
     EDIT_SCHEMA_VERSION,
     EditError,
+    MAX_PAGE_OPS,
+    apply_page_ops,
     check_edit_count,
     collect_image_sources,
+    image_dimensions,
     load_edit_request,
     page_info_of,
     parse_edit_request,
+    parse_page_ops,
     render_edited_pdf,
     resolve_edit_pages,
+    rotated_bbox,
     validate_edit_input_key,
     validate_image_file,
 )
@@ -77,6 +82,16 @@ def make_png_bytes(rgb=(255, 0, 0)):
     raw = b"\x00" + bytes(rgb)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def make_jpeg_bytes(width=8, height=6):
+    """Minimal parseable JPEG (SOI + APP0 + SOF0 + EOI)."""
+    app0 = b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof0 = (b"\x08" + struct.pack(">H", height) + struct.pack(">H", width)
+            + b"\x01\x01\x11\x00")
+    return (b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", len(app0) + 2)
+            + app0 + b"\xff\xc0" + struct.pack(">H", len(sof0) + 2)
+            + sof0 + b"\xff\xd9")
 
 
 def page_text(pdf_bytes):
@@ -360,8 +375,19 @@ class ImageValidationTest(unittest.TestCase):
         fd, path = tempfile.mkstemp(suffix=".jpg")
         try:
             with os.fdopen(fd, "wb") as fh:
-                fh.write(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                fh.write(make_jpeg_bytes())
             self.assertEqual(validate_image_file(path, "i.jpg", 5), "jpeg")
+        finally:
+            os.unlink(path)
+
+    def test_oversize_dimensions_rejected(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(make_jpeg_bytes(width=20000, height=10))
+            with self.assertRaises(EditError):
+                validate_image_file(path, "big.jpg", 5)
         finally:
             os.unlink(path)
 
@@ -585,6 +611,375 @@ class EditRoutingTest(unittest.TestCase):
             self.assertEqual(sizes, [(400.0, 400.0), (200.0, 200.0)])
         finally:
             os.unlink(path)
+
+
+def edit_doc(edit, **over):
+    doc = base_doc(edits=[edit])
+    doc.update(over)
+    return doc
+
+
+def text_edit(**over):
+    edit = {"page": 1, "type": "text", "x": 100, "y": 150,
+            "text": "Hello", "font_size": 16}
+    edit.update(over)
+    return edit
+
+
+class ParseNewTypesTest(unittest.TestCase):
+    def test_text_styling_defaults(self):
+        edit = parse_edit_request(edit_doc(text_edit()))["edits"][0]
+        self.assertEqual(edit["font"], "Helvetica")
+        self.assertEqual(edit["align"], "left")
+        self.assertEqual(edit["alpha"], 1.0)
+        self.assertEqual(edit["underline"], False)
+
+    def test_text_styling_explicit(self):
+        edit = parse_edit_request(edit_doc(text_edit(
+            font="Times-Bold", align="center", alpha=0.5,
+            underline=True)))["edits"][0]
+        self.assertEqual(edit["font"], "Times-Bold")
+        self.assertEqual(edit["align"], "center")
+        self.assertEqual(edit["alpha"], 0.5)
+        self.assertEqual(edit["underline"], True)
+
+    def test_text_bad_font(self):
+        with self.assertRaises(EditError):
+            parse_edit_request(edit_doc(text_edit(font="ComicSans")))
+
+    def test_text_bad_align(self):
+        with self.assertRaises(EditError):
+            parse_edit_request(edit_doc(text_edit(align="justify")))
+
+    def test_text_bad_alpha(self):
+        with self.assertRaises(EditError):
+            parse_edit_request(edit_doc(text_edit(alpha=1.5)))
+
+    def test_ellipse_rect_whiteout(self):
+        for kind in ("ellipse", "whiteout"):
+            parsed = parse_edit_request(edit_doc({
+                "page": 1, "type": kind, "x": 10, "y": 10,
+                "width": 50, "height": 40, "color": "#FF0000"})
+            )["edits"][0]
+            self.assertEqual(parsed["type"], kind)
+        white = parse_edit_request(edit_doc({
+            "page": 1, "type": "whiteout", "x": 10, "y": 10,
+            "width": 50, "height": 40, "color": "#FFFFFF",
+            "alpha": 0.2}))["edits"][0]
+        self.assertEqual(white["alpha"], 1.0)  # forced opaque
+
+    def test_underline_strike(self):
+        for kind in ("underline", "strike"):
+            edit = parse_edit_request(edit_doc({
+                "page": 1, "type": kind, "x": 10, "y": 10,
+                "width": 50, "height": 12, "color": "#000000",
+                "thickness": 2}))["edits"][0]
+            self.assertEqual(edit["thickness"], 2)
+        edit = parse_edit_request(edit_doc({
+            "page": 1, "type": "underline", "x": 10, "y": 10,
+            "width": 50, "height": 12}))["edits"][0]
+        self.assertEqual(edit["thickness"], 1.5)  # default
+        self.assertEqual(edit["color"], "#000000")
+        with self.assertRaises(EditError):
+            parse_edit_request(edit_doc({
+                "page": 1, "type": "strike", "x": 10, "y": 10,
+                "width": 50, "height": 12, "thickness": 99}))
+
+    def test_line_arrow(self):
+        edit = parse_edit_request(edit_doc({
+            "page": 1, "type": "arrow", "x1": 10, "y1": 10,
+            "x2": 80, "y2": 60, "color": "#0000FF"}))["edits"][0]
+        self.assertEqual(
+            (edit["x1"], edit["y1"], edit["x2"], edit["y2"]),
+            (10, 10, 80, 60))
+        with self.assertRaises(EditError):
+            parse_edit_request(edit_doc({
+                "page": 1, "type": "line", "x1": 10, "y1": 10,
+                "x2": -5, "y2": 60}))
+
+    def test_link_ok(self):
+        edit = parse_edit_request(edit_doc({
+            "page": 1, "type": "link", "x": 10, "y": 10,
+            "width": 50, "height": 12,
+            "url": "https://example.com/docs?a=1"}))["edits"][0]
+        self.assertEqual(edit["url"], "https://example.com/docs?a=1")
+
+    def test_link_rejects_dangerous_schemes(self):
+        for url in ("javascript:alert(1)", "data:text/html,hi",
+                    "file:///etc/passwd", "ftp://example.com/x",
+                    "not a url", "", "https://exa mple.com"):
+            with self.assertRaises(EditError, msg=url):
+                parse_edit_request(edit_doc({
+                    "page": 1, "type": "link", "x": 10, "y": 10,
+                    "width": 50, "height": 12, "url": url}))
+
+    def test_image_rotation(self):
+        edit = parse_edit_request(edit_doc({
+            "page": 1, "type": "image", "x": 10, "y": 10,
+            "width": 50, "height": 40, "src": "u/img.png",
+            "rotation": 45}))["edits"][0]
+        self.assertEqual(edit["rotation"], 45)
+        with self.assertRaises(EditError):
+            parse_edit_request(edit_doc({
+                "page": 1, "type": "image", "x": 10, "y": 10,
+                "width": 50, "height": 40, "src": "u/img.png",
+                "rotation": 720}))
+
+    def test_rotated_bbox_math(self):
+        self.assertEqual(rotated_bbox(10, 10, 50, 40, 0), (10, 10, 50, 40))
+        bx, by, bw, bh = rotated_bbox(10, 10, 50, 40, 90)
+        self.assertAlmostEqual(bw, 40)
+        self.assertAlmostEqual(bh, 50)
+        bx, by, bw, bh = rotated_bbox(10, 10, 50, 40, 180)
+        self.assertAlmostEqual((bw, bh), (50, 40))
+
+    def test_image_dimensions(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(make_png_bytes())
+            self.assertEqual(image_dimensions(path, "png"), (1, 1))
+        finally:
+            os.unlink(path)
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(make_jpeg_bytes(width=8, height=6))
+            self.assertEqual(image_dimensions(path, "jpeg"), (8, 6))
+        finally:
+            os.unlink(path)
+
+
+class ParsePageOpsTest(unittest.TestCase):
+    def test_absent_is_empty(self):
+        self.assertEqual(parse_edit_request(base_doc())["page_ops"], [])
+
+    def test_all_actions(self):
+        ops = parse_page_ops([
+            {"action": "rotate", "page": 1, "angle": 90},
+            {"action": "delete", "page": 2},
+            {"action": "move", "page": 3, "to": 1},
+            {"action": "insert_blank", "at": 2}])
+        self.assertEqual([op["action"] for op in ops],
+                         ["rotate", "delete", "move", "insert_blank"])
+
+    def test_bad_action_angle_bounds(self):
+        with self.assertRaises(EditError):
+            parse_page_ops([{"action": "flip", "page": 1}])
+        with self.assertRaises(EditError):
+            parse_page_ops([{"action": "rotate", "page": 1, "angle": 45}])
+        with self.assertRaises(EditError):
+            parse_page_ops([{"action": "delete", "page": 0}])
+        with self.assertRaises(EditError):
+            parse_page_ops([{"action": "move", "page": 1, "to": 0}])
+
+    def test_op_count_cap(self):
+        with self.assertRaises(EditError):
+            parse_page_ops([{"action": "delete", "page": 1}]
+                           * (MAX_PAGE_OPS + 1))
+
+
+class ApplyPageOpsTest(unittest.TestCase):
+    def _apply(self, widths, ops):
+        import tempfile
+        fd, src = tempfile.mkstemp(suffix=".pdf")
+        fd2, dst = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd2)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(make_pdf_bytes(widths))
+            return apply_page_ops(src, ops, dst)
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def _apply_sizes(self, sizes_list, ops):
+        import tempfile
+        writer = PdfWriter()
+        for width, height in sizes_list:
+            writer.add_blank_page(width=width, height=height)
+        fd, src = tempfile.mkstemp(suffix=".pdf")
+        fd2, dst = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd2)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                writer.write(fh)
+            return apply_page_ops(src, ops, dst)
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def test_rotate_swaps_dimensions(self):
+        sizes, count = self._apply_sizes(
+            [(400, 600)], [{"action": "rotate", "page": 1, "angle": 90}])
+        self.assertEqual(count, 1)
+        self.assertEqual(sizes, [(600.0, 400.0)])
+
+    def test_rotate_180_keeps_dimensions(self):
+        sizes, count = self._apply([400], [{"action": "rotate", "page": 1,
+                                            "angle": 180}])
+        self.assertEqual(sizes, [(400.0, 400.0)])
+
+    def test_rotate_direction_clockwise(self):
+        # Marker text at top-left must move to top-right after 90 CW.
+        import re
+        import tempfile
+        from reportlab.pdfgen import canvas as rl_canvas
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(400, 600))
+        c.setFont("Helvetica", 20)
+        c.drawString(50, 500, "TOPMARK")
+        c.save()
+        fd, src = tempfile.mkstemp(suffix=".pdf")
+        fd2, dst = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd2)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(buf.getvalue())
+            sizes, _ = apply_page_ops(
+                src, [{"action": "rotate", "page": 1, "angle": 90}], dst)
+            self.assertEqual(sizes, [(600.0, 400.0)])
+            reader = PdfReader(dst)
+            stream = reader.pages[0].get_contents().get_data()
+            mats = re.findall(
+                rb"([-\d.]+) ([-\d.]+) ([-\d.]+) ([-\d.]+) "
+                rb"([-\d.]+) ([-\d.]+) cm", stream)
+            found = [tuple(float(v) for v in m) for m in mats]
+            # 90 CW maps (x, y) -> (y, W - x): matrix [0, -1, 1, 0, 0, 400].
+            self.assertTrue(
+                any(abs(a) < 1e-6 and abs(b + 1) < 1e-6
+                    and abs(c - 1) < 1e-6 and abs(d) < 1e-6
+                    and abs(e) < 1e-6 and abs(f - 400) < 1e-3
+                    for a, b, c, d, e, f in found),
+                "90 CW rotation matrix not found: %r" % (found,))
+            text = reader.pages[0].extract_text() or ""
+            self.assertIn("TOPMARK", text)
+        finally:
+            os.unlink(src)
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def test_delete_move_insert(self):
+        sizes, count = self._apply(
+            [100, 200, 300],
+            [{"action": "delete", "page": 2},
+             {"action": "move", "page": 2, "to": 1},
+             {"action": "insert_blank", "at": 3}])
+        self.assertEqual(count, 3)
+        # [100, 300] -> move 300 first -> [300, 100] -> blank sized like the
+        # current first page (300) inserted at 3.
+        self.assertEqual(sizes, [(300.0, 300.0), (100.0, 100.0),
+                                 (300.0, 300.0)])
+
+    def test_delete_only_page_rejected(self):
+        with self.assertRaises(EditError):
+            self._apply([100], [{"action": "delete", "page": 1}])
+
+    def test_out_of_range_rejected(self):
+        with self.assertRaises(EditError):
+            self._apply([100], [{"action": "rotate", "page": 5,
+                                 "angle": 90}])
+        with self.assertRaises(EditError):
+            self._apply([100], [{"action": "insert_blank", "at": 9}])
+
+
+@NEEDS_RENDER
+class RenderNewTypesTest(unittest.TestCase):
+    def test_all_new_types_render(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            doc = base_doc(edits=[
+                text_edit(font="Times-Bold", align="center", alpha=0.8,
+                          underline=True),
+                {"page": 1, "type": "ellipse", "x": 10, "y": 10,
+                 "width": 60, "height": 40, "color": "#00FF00", "border": 3,
+                 "alpha": 0.5},
+                {"page": 1, "type": "line", "x1": 10, "y1": 10,
+                 "x2": 100, "y2": 100, "color": "#0000FF", "thickness": 2},
+                {"page": 1, "type": "arrow", "x1": 10, "y1": 200,
+                 "x2": 100, "y2": 250, "color": "#0000FF"},
+                {"page": 1, "type": "underline", "x": 10, "y": 300,
+                 "width": 80, "height": 12, "color": "#FF0000"},
+                {"page": 1, "type": "strike", "x": 10, "y": 320,
+                 "width": 80, "height": 12, "color": "#FF0000"},
+                {"page": 1, "type": "whiteout", "x": 10, "y": 400,
+                 "width": 80, "height": 20, "color": "#FFFFFF"},
+                {"page": 1, "type": "link", "x": 10, "y": 450,
+                 "width": 80, "height": 20, "url": "https://example.com"},
+            ])
+            req = parse_edit_request(doc)
+            grouped = resolve_edit_pages(req["edits"], [(600.0, 600.0)])
+            src_fd, src = tempfile.mkstemp(suffix=".pdf")
+            try:
+                with os.fdopen(src_fd, "wb") as fh:
+                    fh.write(make_pdf_bytes([600]))
+                render_edited_pdf(src, "u/d.pdf", grouped, {}, path)
+            finally:
+                os.unlink(src)
+            reader = PdfReader(path)
+            text = reader.pages[0].extract_text() or ""
+            self.assertIn("Hello", text)
+            annots = reader.pages[0].get("/Annots")
+            self.assertTrue(annots and len(annots) == 1)
+            uri = annots[0]["/A"]["/URI"]
+            self.assertEqual(str(uri), "https://example.com")
+        finally:
+            os.unlink(path)
+
+    def test_rotated_image_renders(self):
+        import tempfile
+        src_fd, src = tempfile.mkstemp(suffix=".pdf")
+        img_fd, img = tempfile.mkstemp(suffix=".png")
+        out_fd, out = tempfile.mkstemp(suffix=".pdf")
+        os.close(out_fd)
+        try:
+            with os.fdopen(src_fd, "wb") as fh:
+                fh.write(make_pdf_bytes([600]))
+            with os.fdopen(img_fd, "wb") as fh:
+                fh.write(make_png_bytes())
+            req = parse_edit_request(base_doc(edits=[{
+                "page": 1, "type": "image", "x": 100, "y": 100,
+                "width": 120, "height": 80, "src": "u/i.png",
+                "rotation": 30}]))
+            grouped = resolve_edit_pages(req["edits"], [(600.0, 600.0)])
+            render_edited_pdf(src, "u/d.pdf", grouped, {"u/i.png": img}, out)
+            self.assertEqual(len(PdfReader(out).pages), 1)
+        finally:
+            for path in (src, img, out):
+                if os.path.exists(path):
+                    os.unlink(path)
+
+
+class PageOpsIntegrationTest(unittest.TestCase):
+    def test_ops_then_overlays_on_final_pages(self):
+        source = make_pdf_bytes([400, 400])
+        doc = {"operation": "edit", "version": 1, "input": "u/d.pdf",
+               "output_name": "document",
+               "pages": [{"action": "delete", "page": 1}],
+               "edits": [{"page": 1, "type": "text", "x": 50, "y": 50,
+                          "text": "Final", "font_size": 16}]}
+        result, fake = run_edit(doc, source)
+        self.assertEqual(result["status"], "ok")
+        out = fake.uploaded[result["output_key"]]
+        reader = PdfReader(io.BytesIO(out))
+        self.assertEqual(len(reader.pages), 1)
+        self.assertIn("Final", reader.pages[0].extract_text() or "")
+
+    def test_overlay_page_validated_against_final_pages(self):
+        source = make_pdf_bytes([400, 400])
+        doc = {"operation": "edit", "version": 1, "input": "u/d.pdf",
+               "output_name": "document",
+               "pages": [{"action": "delete", "page": 1}],
+               "edits": [{"page": 2, "type": "text", "x": 50, "y": 50,
+                          "text": "Gone", "font_size": 16}]}
+        result, _ = run_edit(doc, source)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("exceeds", result["reason"])
 
 
 if __name__ == "__main__":

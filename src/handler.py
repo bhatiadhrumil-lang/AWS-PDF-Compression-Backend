@@ -69,6 +69,7 @@ from operations.delete_pages import (
 )
 from operations.edit import (
     EditError,
+    apply_page_ops,
     check_edit_count,
     collect_image_sources,
     load_edit_request,
@@ -532,6 +533,24 @@ def process_delete_record(bucket, manifest_key, cfg=None):
             "output_key": out_key}
 
 
+def apply_edit_page_ops(local_input, page_ops, workdir, source_key):
+    """Apply manifest page ops, returning (working_pdf, sizes, page_count).
+
+    Without ops this is a pass-through: (local_input, original sizes/count).
+    With ops, the transformed document is written to the workdir and overlay
+    page numbers resolve against the FINAL pages.
+    """
+    from operations.edit import apply_page_ops, page_info_of
+
+    if not page_ops:
+        sizes, count = page_info_of(local_input, source_key)
+        return local_input, sizes, count
+    working_input = os.path.join(workdir, "pages.pdf")
+    sizes, count = apply_page_ops(
+        local_input, page_ops, working_input, source_key)
+    return working_input, sizes, count
+
+
 def process_edit_record(bucket, manifest_key, cfg=None):
     """Process one edit-request manifest. Returns a result dict (never raises).
 
@@ -589,6 +608,14 @@ def process_edit_record(bucket, manifest_key, cfg=None):
                 page_sizes, page_count = page_info_of(local_input, source_key)
             except EditError as exc:
                 return failed(str(exc))
+            # Page operations (rotate/delete/move/insert_blank) run BEFORE
+            # overlays; overlay page numbers always refer to the FINAL pages.
+            # Absent "pages", this is a pass-through (working file == input).
+            try:
+                working_input, page_sizes, page_count = apply_edit_page_ops(
+                    local_input, request["page_ops"], workdir, source_key)
+            except EditError as exc:
+                return failed(str(exc))
             try:
                 grouped = resolve_edit_pages(request["edits"], page_sizes)
             except EditError as exc:
@@ -613,7 +640,7 @@ def process_edit_record(bucket, manifest_key, cfg=None):
             print("Applying %d edit(s) on %d page(s) for manifest=%r"
                   % (len(request["edits"]), page_count, manifest_key))
             try:
-                render_edited_pdf(local_input, source_key, grouped,
+                render_edited_pdf(working_input, source_key, grouped,
                                   image_paths, edited_file)
             except EditError as exc:
                 return failed(str(exc))

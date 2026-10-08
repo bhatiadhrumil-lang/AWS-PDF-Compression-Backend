@@ -187,25 +187,42 @@ no rasterization). Deleting every page is rejected — a zero-page PDF is
 never produced. No new limits: source size reuses `MAX_FILE_SIZE_MB`;
 page selection reuses the `SPLIT_MAX_RANGES` cap.
 
-### Edit PDF v1
+### Edit PDF (professional editor)
 
 Status: Backend implemented + local/docker-tested, **NOT deployed**
 (no `.edit.json` S3 trigger configured yet; Lambda still runs the
-pre-edit image).
+pre-edit image). Code pushed to GitHub; AWS deployment happens via the
+existing CodePipeline — never manually.
 
 Single-file, single-output operation: one source PDF + manifest →
-one `edit/<request-id>/<stem>-edited.pdf`. The manifest carries an ordered
-list of overlay edits (schema `version: 1`): `text`, `draw` (freehand
-polyline), `highlight` (translucent rect), `rect` (stroked rectangle), and
-`image` (PNG/JPEG uploaded to the input bucket, referenced by exact S3
-key). Coordinates are PDF points with bottom-left origin (never screen
-pixels); every box/point must fit inside its page. Overlays are vector
-content merged per touched page (reportlab authoring + pypdf merge) — no
-rasterization; original content/order/count/metadata preserved. New limits:
-`EDIT_MAX_EDITS` (200), `EDIT_MAX_IMAGE_MB` (5); source size reuses
-`MAX_FILE_SIZE_MB`. Limitations: overlays apply in unrotated page space
-(pages with `/Rotate` may misalign); Helvetica only; images stretch to the
-given box.
+one `edit/<request-id>/<stem>-edited.pdf`. The manifest carries schema
+`version: 1` (unchanged; v1 manifests still validate byte-for-byte) plus
+additive fields:
+
+* Overlay types: `text` (font/align/alpha/underline + optional rotation),
+  `draw` (freehand polyline, alpha), `highlight`, `rect`, `ellipse`,
+  `line`, `arrow`, `underline`, `strike`, `whiteout`, `link`
+  (clickable http/https annotation), `image` (PNG/JPEG + rotation).
+* Optional top-level `pages` operations that run BEFORE overlays, in order:
+  `rotate` (90/180/270, content-transformed so no `/Rotate` remains),
+  `delete`, `move` (reorder), `insert_blank`. Overlay page numbers always
+  refer to the FINAL (post-operation) pages; per-page net rotations are
+  composed into overlay geometry with the same formula the canvas uses,
+  so the editor preview is WYSIWYG.
+* Coordinates are PDF points with bottom-left origin (never screen
+  pixels); every box/point (including rotation bboxes) must fit inside
+  its page. Overlays are vector content merged per touched page
+  (reportlab authoring + pypdf merge) — no rasterization; original
+  content/order/count/metadata preserved.
+* Limits: `EDIT_MAX_EDITS` (200 overlays), `EDIT_MAX_IMAGE_MB` (5),
+  `MAX_PAGE_OPS` (100 ops), images also capped at 12000 px per side
+  (dimensions parsed from PNG/JPEG headers with stdlib — no Pillow);
+  source size reuses `MAX_FILE_SIZE_MB`.
+* Limitations (honest): `whiteout` is a visual opaque cover, NOT secure
+  redaction (original content stays in the file); existing PDF text is
+  replaced via whiteout + new text, never mutated in place (embedded
+  fonts/encodings make true mutation unsafe); only the 12 built-in
+  reportlab fonts are available; links support http/https only.
 
 ## Single-file vs multi-file operations
 
@@ -432,16 +449,37 @@ objects (e.g. `uploads/<request-id>/img-0.png`) BEFORE the manifest:
 * `input` (required): exact S3 key, same bucket (verbatim, never decoded).
   Same `.pdf`/size/`%PDF-`/non-empty/not-encrypted checks as other inputs.
 * `edits` (required, non-empty, max `EDIT_MAX_EDITS`): each has a
-  1-indexed `page` (must exist), a `type`, and type fields:
+  1-indexed `page` (must exist **after** page ops run), a `type`, and type fields:
   - `text`: `x`, `y`, `text` (1..2000 chars), `font_size` (6..144),
-    `color` (#RRGGBB). Position is the text baseline start.
-  - `draw`: `points` ([[x,y],...], 2..2000), `width` (line, ≤50), `color`.
+    `color` (#RRGGBB), `font` (one of 12 built-ins, default Helvetica),
+    `align` (left/center/right — anchors `x`, default left),
+    `alpha` (0..1, default 1), `underline` (bool, default false),
+    `rotation` (clockwise degrees, default 0). Position is the text
+    baseline start (or anchor for center/right).
+  - `draw`: `points` ([[x,y],...], 2..2000), `width` (line, ≤50), `color`,
+    `alpha` (default 1).
   - `highlight`: `x`, `y`, `width`, `height`, `color`, `alpha` (0..1,
     default 1). Filled translucent rect.
-  - `rect`: same box fields + `border` (default 2, ≤50); filled only when
-    `alpha` < 1.
+  - `rect`/`ellipse`: same box fields + `border` (default 2, ≤50); filled
+    only when `alpha` < 1.
+  - `line`/`arrow`: `x1`, `y1`, `x2`, `y2` endpoints, `color`,
+    `thickness` (0.5..20, default 1.5); arrowhead at the end point.
+  - `underline`/`strike`: annotation box fields + `color`, `thickness`;
+    the line is drawn near the box bottom (underline) or middle (strike).
+  - `whiteout`: box fields + `color` (alpha forced to 1) — opaque visual
+    cover, NOT redaction.
+  - `link`: box fields + `url` (http/https only, ≤2000 chars) — creates a
+    real clickable `/Link` annotation; no visible content of its own.
   - `image`: `x`, `y`, `width`, `height`, `src` (exact S3 key of a PNG/JPEG
-    ≤ `EDIT_MAX_IMAGE_MB`, validated by magic bytes; stretched to the box).
+    ≤ `EDIT_MAX_IMAGE_MB` and ≤12000 px per side, validated by magic bytes
+    + header dimensions), `rotation` (-360..360, default 0).
+* `pages` (optional): page operations applied BEFORE overlays, in order
+  (max `MAX_PAGE_OPS` = 100): `{"action":"rotate","page":N,"angle":90|180|270}`,
+  `{"action":"delete","page":N}` (never the only page),
+  `{"action":"move","page":N,"to":M}` (1-based final position),
+  `{"action":"insert_blank","at":K}` (blank sized like the current first
+  page). Rotation bakes the content transform into the page (no `/Rotate`
+  left behind).
 * Coordinates are PDF points, origin bottom-left; everything must fit inside
   the page mediabox or the request fails with a clear error.
 * `output_name` (optional stem): same sanitization as split/rotate/delete;
