@@ -3,7 +3,8 @@
 Official backend source of truth for the PDF platform's server-side processing.
 Today: **PDF compression**, **PDF merge**, **PDF split**, **PDF rotate**,
 **Delete Pages** — all five implemented, deployed, and verified end-to-end
-on AWS — plus **Edit PDF v1** (implemented, tested, not yet deployed). More
+on AWS — plus **Edit PDF v1** and **Extract Pages** (both implemented,
+tested, not yet deployed). More
 operations will plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
@@ -39,6 +40,10 @@ S3 input bucket  (ObjectCreated)
        → src/handler.py :: process_delete_record
        → pypdf delete in src/operations/delete_pages.py (remove listed pages)
        → S3 output bucket (delete/<request-id>/<stem>-deleted.pdf)
+ └── *.extract.json     (ExtractPDF notification, prefix extract-requests/
+                         — NOT deployed yet; code routes it to
+                         process_extract_record using operations/extract.py
+                         → output extract/<request-id>/<stem>-extracted.pdf)
  (EditPDF notification `*.edit.json`, prefix edit-requests/ — NOT deployed yet;
   code routes it to process_edit_record using operations/edit.py → output
   edit/<request-id>/<stem>-edited.pdf.)
@@ -56,11 +61,14 @@ src/
     split.py             pypdf split (one input -> ZIP of PDFs)
     rotate.py            pypdf rotate (one input -> one rotated PDF)
     delete_pages.py      pypdf delete-pages (one input -> one trimmed PDF)
+    extract.py           pypdf extract-pages (one input -> one subset PDF)
     edit.py              overlay edits (one input -> one edited PDF, NOT deployed)
   common/
     s3.py                head/download/upload (lazy boto3 import)
     filenames.py         key decoding, .pdf detection, output naming
-    page_ranges.py       shared page-range parser (split + rotate + delete)
+    page_ranges.py       shared page-range parser (split + rotate + delete;
+                         extract reuses the token syntax via its own
+                         order-preserving resolver)
     validation.py        size limits, %PDF- magic check
     cleanup.py           per-record temp workdirs
 tests/                   stdlib unittest, all AWS calls mocked
@@ -186,6 +194,19 @@ split/rotate). Remaining pages keep order, content, and metadata (pypdf,
 no rasterization). Deleting every page is rejected — a zero-page PDF is
 never produced. No new limits: source size reuses `MAX_FILE_SIZE_MB`;
 page selection reuses the `SPLIT_MAX_RANGES` cap.
+
+### Extract Pages
+
+Status: Backend implemented + tested, **NOT deployed** (no `.extract.json`
+trigger yet; needs the same one-line notification as split/rotate/delete
+plus an image rebuild — deployment happens separately, never from here).
+
+Single-file, single-output operation: one source PDF + manifest →
+one `extract/<request-id>/<stem>-extracted.pdf` containing ONLY the
+selected pages. Ranges expand IN REQUESTED ORDER and duplicates are
+normalized (first occurrence wins): `[5, 2, 8]` extracts pages 5, 2, 8 in
+exactly that order. The source PDF is never modified. New cap
+`EXTRACT_MAX_PAGES` (default 500) bounds the selection.
 
 ### Edit PDF (professional editor)
 
@@ -426,6 +447,42 @@ invalid/encrypted PDF, invalid/out-of-bounds/overlapping pages, deleting
 all pages, output failure, upload failure. User-safe reasons; tracebacks to
 CloudWatch only. No new limits or env vars.
 
+## Extract request contract
+
+Manifest `extract-requests/<request-id>.extract.json`, uploaded AFTER the
+source PDF (same input bucket):
+
+```json
+{ "operation": "extract", "input": "uploads/<request-id>/document.pdf",
+  "pages": [1, 3, 5, 6, 7], "output_name": "document" }
+```
+
+* `operation` optional (`.extract.json` suffix implies extract; if present
+  must equal `"extract"`).
+* `input` (required): one plain (decoded) S3 key, same bucket; URL-encoded
+  accepted. Same `.pdf`/size/`%PDF-`/non-empty/not-encrypted checks as the
+  other single-input operations.
+* `pages` (required, non-empty): ints and/or `"5"` / `"1-3"` tokens naming
+  the pages to KEEP. Tokens use the shared `common.page_ranges` syntax
+  (whitespace tolerated; rejects 0, negatives, empty, malformed, reversed).
+  Expansion preserves REQUESTED order and drops duplicate pages (first
+  occurrence wins) — overlap is normalized, not an error. Every page must
+  fall within 1..page-count, and the final list may not exceed
+  `EXTRACT_MAX_PAGES` (default 500). An empty selection is rejected — a
+  zero-page PDF is never produced.
+* `output_name` (optional stem): same sanitization as split/rotate/delete;
+  falls back to the request id.
+
+Output: one PDF at `extract/<request-id>/<stem>-extracted.pdf` (request id
+always embedded — the frontend polls this EXACT key).
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"extract", "output_key": ..., "reason": ...}`. Covered failures: missing /
+malformed manifest, wrong operation, missing input key or S3 object,
+invalid/encrypted/empty PDF, invalid/out-of-bounds pages, empty selection,
+too many pages, output failure, upload failure. User-safe reasons;
+tracebacks to CloudWatch only.
+
 ## Edit request contract (v1)
 
 Manifest `edit-requests/<request-id>.edit.json`, uploaded AFTER the source
@@ -593,6 +650,7 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 | `MERGE_MAX_TOTAL_MB` | no | `200` | max combined merge input size (MB) |
 | `SPLIT_MAX_RANGES` | no | `50` | max page ranges per split request |
 | `SPLIT_MAX_OUTPUTS` | no | `200` | max PDFs generated per split request |
+| `EXTRACT_MAX_PAGES` | no | `500` | max pages copied per extract request |
 | `EDIT_MAX_EDITS` | no | `200` | max overlay edits per edit request |
 | `EDIT_MAX_IMAGE_MB` | no | `5` | max MB per embedded edit image |
 | `TMP_DIR` | no | system temp | temp workdir base |
@@ -602,10 +660,11 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 335 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 404 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
   src/operations/split.py src/operations/rotate.py \
+  src/operations/extract.py \
   src/operations/delete_pages.py src/operations/edit.py src/common/*.py
 ```
 
@@ -631,7 +690,11 @@ invalid/missing inputs, cleanup, delete routing, plus edit: manifest and
 per-type validation, bad version/type/page/color/size rejects, page-fit
 rejects, image validation, text/highlight/rect/draw/image rendering,
 metadata preservation, special filenames, missing inputs/images, cleanup,
-edit routing and config.
+edit routing and config, plus extract: single/multi/range/mixed selections,
+requested-order preservation, duplicate normalization, parser rejects
+(0/negative/reversed/malformed/empty), out-of-bounds pages, empty selection,
+corrupted/missing inputs, output page count and content, source untouched,
+extract routing and config.
 
 ## Docker
 

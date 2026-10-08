@@ -23,6 +23,10 @@ Optional:
                     Rationale: split-all emits one PDF per page; 200 bounds
                     /tmp usage (input + parts + ZIP) and per-page pypdf work
                     inside the timeout. Also caps pathological page counts.
+  EXTRACT_MAX_PAGES max pages copied per extract request (default 500).
+                    Rationale: page copies are cheap pypdf work into a single
+                    output PDF, but the cap bounds manifest size, /tmp usage
+                    (input + output), and the 300 s timeout.
   EDIT_MAX_EDITS    max overlay edits per edit request (default 200).
                     Rationale: each edit is cheap vector content, but the cap
                     bounds manifest size, per-edit validation, and overlay
@@ -40,6 +44,7 @@ DEFAULT_MERGE_MAX_FILES = 20
 DEFAULT_MERGE_MAX_TOTAL_MB = 200
 DEFAULT_SPLIT_MAX_RANGES = 50
 DEFAULT_SPLIT_MAX_OUTPUTS = 200
+DEFAULT_EXTRACT_MAX_PAGES = 500
 DEFAULT_EDIT_MAX_EDITS = 200
 DEFAULT_EDIT_MAX_IMAGE_MB = 5
 
@@ -58,6 +63,7 @@ class Config:
                  merge_max_total_mb=DEFAULT_MERGE_MAX_TOTAL_MB,
                  split_max_ranges=DEFAULT_SPLIT_MAX_RANGES,
                  split_max_outputs=DEFAULT_SPLIT_MAX_OUTPUTS,
+                 extract_max_pages=DEFAULT_EXTRACT_MAX_PAGES,
                  edit_max_edits=DEFAULT_EDIT_MAX_EDITS,
                  edit_max_image_mb=DEFAULT_EDIT_MAX_IMAGE_MB):
         self.input_bucket = input_bucket
@@ -68,6 +74,7 @@ class Config:
         self.merge_max_total_mb = merge_max_total_mb
         self.split_max_ranges = split_max_ranges
         self.split_max_outputs = split_max_outputs
+        self.extract_max_pages = extract_max_pages
         self.edit_max_edits = edit_max_edits
         self.edit_max_image_mb = edit_max_image_mb
 
@@ -106,6 +113,9 @@ def from_env(env=None):
         ),
         split_max_outputs=_positive_int(
             env.get("SPLIT_MAX_OUTPUTS"), DEFAULT_SPLIT_MAX_OUTPUTS
+        ),
+        extract_max_pages=_positive_int(
+            env.get("EXTRACT_MAX_PAGES"), DEFAULT_EXTRACT_MAX_PAGES
         ),
         edit_max_edits=_positive_int(
             env.get("EDIT_MAX_EDITS"), DEFAULT_EDIT_MAX_EDITS

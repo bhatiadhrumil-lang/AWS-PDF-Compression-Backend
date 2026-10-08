@@ -11,14 +11,17 @@ from common import s3 as s3_client
 from common.cleanup import temp_workdir
 from common.filenames import (
     DELETE_MANIFEST_SUFFIX,
+    EXTRACT_MANIFEST_SUFFIX,
     ROTATE_MANIFEST_SUFFIX,
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
     delete_output_key_for,
     edit_output_key_for,
+    extract_output_key_for,
     has_pdf_extension,
     is_delete_manifest_key,
     is_edit_manifest_key,
+    is_extract_manifest_key,
     is_merge_manifest_key,
     is_rotate_manifest_key,
     is_split_manifest_key,
@@ -67,6 +70,15 @@ from operations.delete_pages import (
     delete_pdf_pages,
     validate_delete_input_key,
 )
+from operations.extract import (
+    ExtractError,
+    check_extract_page_count,
+    extract_pdf,
+    load_extract_request,
+    page_count_of as extract_page_count_of,
+    resolve_extract_pages,
+    validate_extract_input_key,
+)
 from operations.edit import (
     EditError,
     apply_page_ops,
@@ -113,6 +125,8 @@ def process_record(record, cfg=None):
         return process_rotate_record(bucket, key, cfg)
     if is_delete_manifest_key(key):
         return process_delete_record(bucket, key, cfg)
+    if is_extract_manifest_key(key):
+        return process_extract_record(bucket, key, cfg)
     if is_edit_manifest_key(key):
         return process_edit_record(bucket, key, cfg)
     if not has_pdf_extension(key):
@@ -530,6 +544,92 @@ def process_delete_record(bucket, manifest_key, cfg=None):
 
     print("Delete done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "delete",
+            "output_key": out_key}
+
+
+def process_extract_record(bucket, manifest_key, cfg=None):
+    """Process one extract-request manifest. Returns a result dict (never raises).
+
+    Downloads the manifest, then the single source PDF, into a unique temp
+    workdir (removed on success and failure), validates, copies the selected
+    pages IN REQUESTED ORDER into a single new PDF, and uploads it to
+    "extract/<request-id>/<stem>-extracted.pdf". The source PDF is never
+    modified. An empty selection is rejected — a zero-page PDF is never
+    produced.
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("EXTRACT FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "extract", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-extract-") as workdir:
+            manifest_file = os.path.join(workdir, "request.extract.json")
+            print("Downloading extract request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download extract request: %s" % exc)
+            try:
+                request = load_extract_request(manifest_file)
+            except ExtractError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            try:
+                validate_extract_input_key(source_key)
+            except ExtractError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading extract input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_count = extract_page_count_of(local_input, source_key)
+            except ExtractError as exc:
+                return failed(str(exc))
+
+            try:
+                pages = resolve_extract_pages(
+                    request["pages"], page_count, cfg.extract_max_pages)
+                check_extract_page_count(len(pages), cfg.extract_max_pages)
+            except ExtractError as exc:
+                return failed(str(exc))
+
+            extracted_file = os.path.join(workdir, "extracted.pdf")
+            print("Extracting %d page(s) of %d for manifest=%r"
+                  % (len(pages), page_count, manifest_key))
+            try:
+                extract_pdf(local_input, source_key, pages, extracted_file)
+            except ExtractError as exc:
+                return failed(str(exc))
+
+            out_key = extract_output_key_for(request["output_name"], manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(extracted_file, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload extracted PDF: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("Extract done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "extract",
             "output_key": out_key}
 
 
