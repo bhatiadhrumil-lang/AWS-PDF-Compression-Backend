@@ -12,6 +12,7 @@ from common.cleanup import temp_workdir
 from common.filenames import (
     DELETE_MANIFEST_SUFFIX,
     EXTRACT_MANIFEST_SUFFIX,
+    JPG2PDF_MANIFEST_SUFFIX,
     ROTATE_MANIFEST_SUFFIX,
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
@@ -22,9 +23,11 @@ from common.filenames import (
     is_delete_manifest_key,
     is_edit_manifest_key,
     is_extract_manifest_key,
+    is_jpg_to_pdf_manifest_key,
     is_merge_manifest_key,
     is_rotate_manifest_key,
     is_split_manifest_key,
+    jpg_to_pdf_output_key_for,
     merged_output_key_for,
     output_key_for,
     request_id_from_manifest,
@@ -32,7 +35,7 @@ from common.filenames import (
     sanitize_split_stem,
     split_output_key_for,
 )
-from common.validation import size_ok, validate_local_pdf
+from common.validation import size_ok, validate_local_jpg, validate_local_pdf
 from config import from_env
 from operations.compress import compress_pdf
 from operations.merge import (
@@ -78,6 +81,15 @@ from operations.extract import (
     page_count_of as extract_page_count_of,
     resolve_extract_pages,
     validate_extract_input_key,
+)
+from operations.jpg_to_pdf import (
+    JpgToPdfError,
+    check_jpg_counts,
+    check_jpg_total_size,
+    image_size_of,
+    jpg_images_to_pdf,
+    load_jpg_to_pdf_request,
+    validate_jpg_input_key,
 )
 from operations.edit import (
     EditError,
@@ -127,6 +139,8 @@ def process_record(record, cfg=None):
         return process_delete_record(bucket, key, cfg)
     if is_extract_manifest_key(key):
         return process_extract_record(bucket, key, cfg)
+    if is_jpg_to_pdf_manifest_key(key):
+        return process_jpg_to_pdf_record(bucket, key, cfg)
     if is_edit_manifest_key(key):
         return process_edit_record(bucket, key, cfg)
     if not has_pdf_extension(key):
@@ -630,6 +644,95 @@ def process_extract_record(bucket, manifest_key, cfg=None):
 
     print("Extract done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "extract",
+            "output_key": out_key}
+
+
+def process_jpg_to_pdf_record(bucket, manifest_key, cfg=None):
+    """Process one jpg-to-pdf request manifest (never raises).
+
+    Downloads the manifest, then each image IN MANIFEST ORDER, into a unique
+    temp workdir (removed on success and failure), validates, converts the
+    images into a single PDF (one image per page), and uploads it to
+    "jpg-to-pdf/<request-id>/<safe-name>.pdf". Source images are never
+    modified.
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("JPG2PDF FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "jpg_to_pdf", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-jpg2pdf-") as workdir:
+            manifest_file = os.path.join(workdir, "request.jpg2pdf.json")
+            print("Downloading jpg to pdf request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download jpg to pdf request: %s" % exc)
+            try:
+                request = load_jpg_to_pdf_request(manifest_file)
+            except JpgToPdfError as exc:
+                return failed(str(exc))
+
+            image_keys = request["images"]
+            try:
+                check_jpg_counts(len(image_keys), cfg.jpg2pdf_max_images)
+            except JpgToPdfError as exc:
+                return failed(str(exc))
+            for image_key in image_keys:
+                try:
+                    validate_jpg_input_key(image_key)
+                except JpgToPdfError as exc:
+                    return failed(str(exc))
+            total_bytes = 0
+            for image_key in image_keys:
+                head_size = s3_client.head_object_size(bucket, image_key)
+                if head_size is not None:
+                    ok, within = size_ok(head_size, cfg.max_file_size_mb)
+                    if not ok:
+                        return failed("image %r %s" % (image_key, within))
+                    total_bytes += head_size
+            try:
+                check_jpg_total_size(total_bytes, cfg.jpg2pdf_max_total_mb)
+            except JpgToPdfError as exc:
+                return failed(str(exc))
+
+            local_images = []
+            for pos, image_key in enumerate(image_keys):
+                local_path = os.path.join(workdir, "image-%d.jpg" % pos)
+                print("Downloading jpg input s3://%s/%s" % (bucket, image_key))
+                try:
+                    s3_client.download_file(bucket, image_key, local_path)
+                except Exception as exc:
+                    return failed("cannot download image %r: %s" % (image_key, exc))
+                ok, reason = validate_local_jpg(local_path, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("image %r %s" % (image_key, reason))
+                local_images.append((local_path, image_key))
+
+            converted_file = os.path.join(workdir, "converted.pdf")
+            print("Converting %d image(s) for manifest=%r"
+                  % (len(local_images), manifest_key))
+            try:
+                jpg_images_to_pdf(local_images, converted_file)
+            except JpgToPdfError as exc:
+                return failed(str(exc))
+
+            out_key = jpg_to_pdf_output_key_for(
+                request["output_name"], manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(converted_file, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload converted PDF: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("JpgToPdf done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "jpg_to_pdf",
             "output_key": out_key}
 
 

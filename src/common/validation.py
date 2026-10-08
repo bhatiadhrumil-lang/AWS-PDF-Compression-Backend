@@ -8,6 +8,8 @@ import os
 
 PDF_MAGIC = b"%PDF-"
 PDF_MAGIC_LEN = len(PDF_MAGIC)
+JPEG_MAGIC = b"\xff\xd8\xff"
+JPEG_MAGIC_LEN = len(JPEG_MAGIC)
 
 
 def extension_ok(key):
@@ -50,4 +52,27 @@ def validate_local_pdf(path, max_mb):
         return False, reason
     if not has_pdf_magic(path):
         return False, "not a PDF (missing %%PDF- header)"
+    return True, ""
+
+
+def has_jpg_magic(path):
+    """True if the file starts with the JPEG SOI magic header."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(JPEG_MAGIC_LEN) == JPEG_MAGIC
+    except OSError:
+        return False
+
+
+def validate_local_jpg(path, max_mb):
+    """Post-download validation for a JPG image. Returns (ok, reason)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return False, "cannot stat download: %s" % exc
+    ok, reason = size_ok(size, max_mb)
+    if not ok:
+        return False, reason
+    if not has_jpg_magic(path):
+        return False, "not a JPG image (missing JPEG header)"
     return True, ""

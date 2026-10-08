@@ -3,8 +3,8 @@
 Official backend source of truth for the PDF platform's server-side processing.
 Today: **PDF compression**, **PDF merge**, **PDF split**, **PDF rotate**,
 **Delete Pages** — all five implemented, deployed, and verified end-to-end
-on AWS — plus **Edit PDF v1** and **Extract Pages** (both implemented,
-tested, not yet deployed). More
+on AWS — plus **Edit PDF v1**, **Extract Pages**, and **JPG to PDF**
+(all three implemented, tested, not yet deployed). More
 operations will plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
@@ -44,6 +44,11 @@ S3 input bucket  (ObjectCreated)
                          — NOT deployed yet; code routes it to
                          process_extract_record using operations/extract.py
                          → output extract/<request-id>/<stem>-extracted.pdf)
+ └── *.jpg2pdf.json     (JPGToPDF notification, prefix jpg-to-pdf-requests/
+                         — NOT deployed yet; code routes it to
+                         process_jpg_to_pdf_record using
+                         operations/jpg_to_pdf.py
+                         → output jpg-to-pdf/<request-id>/<name>.pdf)
  (EditPDF notification `*.edit.json`, prefix edit-requests/ — NOT deployed yet;
   code routes it to process_edit_record using operations/edit.py → output
   edit/<request-id>/<stem>-edited.pdf.)
@@ -62,6 +67,7 @@ src/
     rotate.py            pypdf rotate (one input -> one rotated PDF)
     delete_pages.py      pypdf delete-pages (one input -> one trimmed PDF)
     extract.py           pypdf extract-pages (one input -> one subset PDF)
+    jpg_to_pdf.py        reportlab images-to-PDF (N images -> one PDF)
     edit.py              overlay edits (one input -> one edited PDF, NOT deployed)
   common/
     s3.py                head/download/upload (lazy boto3 import)
@@ -207,6 +213,22 @@ selected pages. Ranges expand IN REQUESTED ORDER and duplicates are
 normalized (first occurrence wins): `[5, 2, 8]` extracts pages 5, 2, 8 in
 exactly that order. The source PDF is never modified. New cap
 `EXTRACT_MAX_PAGES` (default 500) bounds the selection.
+
+### JPG to PDF
+
+Status: Backend implemented + tested, **NOT deployed** (no `.jpg2pdf.json`
+trigger yet; needs the same one-line notification as the other manifest
+operations plus an image rebuild — deployment happens separately, never
+from here).
+
+Multi-file, single-output operation: N ordered JPEGs + manifest →
+one `jpg-to-pdf/<request-id>/<safe-name>.pdf` with one image per page in
+exactly the manifest order. JPEGs are embedded directly via reportlab
+(already a runtime dependency — no new packages): no re-encoding, no
+quality loss, aspect ratio preserved, pages sized to each image (mixed
+dimensions supported). RGB and grayscale both work. Source images are
+never modified. New caps `JPG2PDF_MAX_IMAGES` (default 20) and
+`JPG2PDF_MAX_TOTAL_MB` (default 200, same /tmp rationale as merge).
 
 ### Edit PDF (professional editor)
 
@@ -483,6 +505,41 @@ invalid/encrypted/empty PDF, invalid/out-of-bounds pages, empty selection,
 too many pages, output failure, upload failure. User-safe reasons;
 tracebacks to CloudWatch only.
 
+## JPG to PDF request contract
+
+Manifest `jpg-to-pdf-requests/<request-id>.jpg2pdf.json`, uploaded AFTER
+all source images (same input bucket):
+
+```json
+{ "operation": "jpg_to_pdf",
+  "images": ["uploads/<request-id>/photo1.jpg",
+             "uploads/<request-id>/photo2.jpeg"],
+  "output_name": "<request-id>.pdf" }
+```
+
+* `operation` optional (`.jpg2pdf.json` suffix implies jpg_to_pdf; if
+  present must equal `"jpg_to_pdf"`).
+* `images` (required, non-empty, max `JPG2PDF_MAX_IMAGES`): EXACT S3 keys
+  in the same input bucket, used verbatim (never URL-decoded); manifest
+  order is the PDF page order. Each key needs a `.jpg`/`.jpeg` extension
+  (any case), must exist, and must pass per-file size (`MAX_FILE_SIZE_MB`),
+  JPEG-magic, and readability checks. Combined size is capped at
+  `JPG2PDF_MAX_TOTAL_MB` (default 200).
+* `output_name` (optional): sanitized like merge output names (no path
+  traversal, `.pdf` enforced, spaces/parens/unicode preserved); falls back
+  to `<request-id>.pdf`.
+
+Output: one PDF at `jpg-to-pdf/<request-id>/<safe-name>.pdf` (request id
+always embedded — the frontend polls this EXACT key; dedicated namespace,
+never the extract directory).
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"jpg_to_pdf", "output_key": ..., "reason": ...}`. Covered failures: missing
+/ malformed manifest, wrong operation, missing image key or S3 object,
+non-JPG extension, oversize images/total, invalid/corrupted image,
+conversion failure, output failure, upload failure. User-safe reasons;
+tracebacks to CloudWatch only.
+
 ## Edit request contract (v1)
 
 Manifest `edit-requests/<request-id>.edit.json`, uploaded AFTER the source
@@ -604,7 +661,8 @@ never matched frontend polling).
 Supported: spaces, parentheses, brackets, `+`, `&`, `=`, `%`, unicode.
 Display names are the frontend's job; keys here are always the true S3 keys.
 
-Manifest keys (`inputs`/`input` in merge/split/rotate/delete manifests) are
+Manifest keys (`inputs`/`input` in merge/split/rotate/delete/extract
+manifests, `images` in jpg-to-pdf manifests) are
 used VERBATIM — never URL-decoded. They are exact object keys authored by
 the frontend, not event encodings: decoding them corrupted real filenames
 (a manifest input `Report+Final.pdf` was mangled into `Report Final.pdf`
@@ -651,6 +709,8 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 | `SPLIT_MAX_RANGES` | no | `50` | max page ranges per split request |
 | `SPLIT_MAX_OUTPUTS` | no | `200` | max PDFs generated per split request |
 | `EXTRACT_MAX_PAGES` | no | `500` | max pages copied per extract request |
+| `JPG2PDF_MAX_IMAGES` | no | `20` | max JPEGs per jpg-to-pdf request |
+| `JPG2PDF_MAX_TOTAL_MB` | no | `200` | max combined jpg-to-pdf image size (MB) |
 | `EDIT_MAX_EDITS` | no | `200` | max overlay edits per edit request |
 | `EDIT_MAX_IMAGE_MB` | no | `5` | max MB per embedded edit image |
 | `TMP_DIR` | no | system temp | temp workdir base |
@@ -660,11 +720,11 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 404 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 438 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
   src/operations/split.py src/operations/rotate.py \
-  src/operations/extract.py \
+  src/operations/extract.py src/operations/jpg_to_pdf.py \
   src/operations/delete_pages.py src/operations/edit.py src/common/*.py
 ```
 

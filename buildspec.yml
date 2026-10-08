@@ -47,7 +47,8 @@ phases:
         python3 -m py_compile src/app.py src/handler.py src/config.py
         src/operations/compress.py src/operations/merge.py
         src/operations/split.py src/operations/rotate.py
-        src/operations/delete_pages.py src/common/*.py
+        src/operations/delete_pages.py src/operations/extract.py
+        src/operations/edit.py src/operations/jpg_to_pdf.py src/common/*.py
       - echo "Tests and syntax checks passed."
 
   build:
@@ -58,10 +59,11 @@ phases:
       # Smoke test: the image must contain the operations and shared parser.
       - >-
         docker run --rm --entrypoint python "${IMAGE_REPO}:${IMAGE_TAG}" -c
-        "from operations import compress, merge, split, rotate, delete_pages;
+        "from operations import compress, merge, split, rotate, delete_pages, extract, edit, jpg_to_pdf;
         from common import page_ranges, filenames;
-        from common.filenames import delete_output_key_for;
+        from common.filenames import delete_output_key_for, jpg_to_pdf_output_key_for;
         print(delete_output_key_for('doc', 'delete-requests/req-1.delete.json'));
+        print(jpg_to_pdf_output_key_for('photo.jpg', 'jpg-to-pdf-requests/req-1.jpg2pdf.json'));
         print('IMAGE-SMOKE-OK')"
       - echo "Docker build and smoke test passed."
 

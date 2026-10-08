@@ -13,6 +13,8 @@ from urllib.parse import unquote_plus
 OUTPUT_PREFIX = "compressed-"
 MERGE_OUTPUT_PREFIX = "merged-"
 MERGE_MANIFEST_SUFFIX = ".merge.json"
+JPG2PDF_MANIFEST_SUFFIX = ".jpg2pdf.json"
+JPG2PDF_OUTPUT_DIR = "jpg-to-pdf"
 SPLIT_MANIFEST_SUFFIX = ".split.json"
 SPLIT_OUTPUT_DIR = "split"
 ROTATE_MANIFEST_SUFFIX = ".rotate.json"
@@ -40,6 +42,12 @@ def decode_s3_key(key):
 def has_pdf_extension(key):
     """Case-insensitive .pdf check (supports .pdf / .PDF / .Pdf)."""
     return str(key).lower().endswith(".pdf")
+
+
+def has_jpg_extension(key):
+    """Case-insensitive .jpg/.jpeg check (supports .jpg / .JPG / .jpeg)."""
+    lowered = str(key).lower()
+    return lowered.endswith(".jpg") or lowered.endswith(".jpeg")
 
 
 def output_key_for(decoded_key):
@@ -157,6 +165,34 @@ def merged_output_key_for(output_name, manifest_key=""):
             fallback = fallback[: -len(MERGE_MANIFEST_SUFFIX)] + ".pdf"
         safe = sanitize_output_basename(fallback) or "output.pdf"
     return MERGE_OUTPUT_PREFIX + safe
+
+
+def is_jpg_to_pdf_manifest_key(decoded_key):
+    """True if the key is a jpg-to-pdf request manifest (case-insensitive).
+
+    Manifests live under e.g. "jpg-to-pdf-requests/<id>.jpg2pdf.json" and are
+    routed to the jpg_to_pdf operation instead of compression.
+    """
+    return str(decoded_key).lower().endswith(JPG2PDF_MANIFEST_SUFFIX)
+
+
+def jpg_to_pdf_output_key_for(output_name, manifest_key=""):
+    """Build the converted-PDF output key: "jpg-to-pdf/<id>/<safe>.pdf".
+
+    <id> comes from the manifest basename ("<id>.jpg2pdf.json"); if the
+    manifest is oddly shaped the id segment falls back to "request".
+    The name falls back to "<id>.pdf" (or "output.pdf"). The key always
+    embeds the request id, so the frontend can poll this EXACT key and
+    concurrent users can never collide.
+    """
+    request_id = sanitize_split_stem(
+        request_id_from_manifest(manifest_key, JPG2PDF_MANIFEST_SUFFIX))
+    if not request_id:
+        request_id = "request"
+    safe = sanitize_output_basename(output_name)
+    if not safe:
+        safe = sanitize_output_basename(request_id + ".pdf") or "output.pdf"
+    return "%s/%s/%s" % (JPG2PDF_OUTPUT_DIR, request_id, safe)
 
 
 def sanitize_split_stem(name):
