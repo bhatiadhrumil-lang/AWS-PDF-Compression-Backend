@@ -14,6 +14,7 @@ from common.filenames import (
     EXTRACT_MANIFEST_SUFFIX,
     JPG2PDF_MANIFEST_SUFFIX,
     PDF2JPG_MANIFEST_SUFFIX,
+    PROTECT_MANIFEST_SUFFIX,
     ROTATE_MANIFEST_SUFFIX,
     SPLIT_MANIFEST_SUFFIX,
     decode_s3_key,
@@ -27,12 +28,14 @@ from common.filenames import (
     is_jpg_to_pdf_manifest_key,
     is_merge_manifest_key,
     is_pdf_to_jpg_manifest_key,
+    is_protect_manifest_key,
     is_rotate_manifest_key,
     is_split_manifest_key,
     jpg_to_pdf_output_key_for,
     merged_output_key_for,
     output_key_for,
     pdf_to_jpg_output_keys_for,
+    protect_output_key_for,
     request_id_from_manifest,
     rotate_output_key_for,
     sanitize_split_stem,
@@ -115,6 +118,13 @@ from operations.edit import (
     validate_edit_input_key,
     validate_image_file,
 )
+from operations.protect_pdf import (
+    ProtectError,
+    load_protect_request,
+    page_count_of as protect_page_count_of,
+    protect_pdf,
+    validate_protect_input_key,
+)
 
 
 def _record_bucket_key(record):
@@ -157,6 +167,8 @@ def process_record(record, cfg=None):
         return process_pdf_to_jpg_record(bucket, key, cfg)
     if is_edit_manifest_key(key):
         return process_edit_record(bucket, key, cfg)
+    if is_protect_manifest_key(key):
+        return process_protect_record(bucket, key, cfg)
     if not has_pdf_extension(key):
         return skipped("not a .pdf object")
 
@@ -971,6 +983,98 @@ def process_edit_record(bucket, manifest_key, cfg=None):
 
     print("Edit done manifest=%r -> %r" % (manifest_key, out_key))
     return {"status": "ok", "key": manifest_key, "operation": "edit",
+            "output_key": out_key}
+
+
+def process_protect_record(bucket, manifest_key, cfg=None):
+    """Process one protect-request manifest. Returns a result dict (never raises).
+
+    Downloads the manifest, then the single source PDF, into a unique temp
+    workdir (removed on success and failure), validates, encrypts a NEW copy
+    with the requested password (AES-256), and uploads it to
+    "protected/<request-id>/<stem>-protected.pdf". The source PDF is never
+    modified. The password is treated as sensitive data: it is never logged,
+    never included in error messages, and cleared from memory as soon as the
+    encrypted copy is written (the temp workdir, which also holds the
+    manifest containing the password, is removed on every code path).
+    """
+    cfg = cfg or from_env()
+
+    def failed(reason):
+        print("PROTECT FAIL manifest=%r reason=%s" % (manifest_key, reason))
+        return {"status": "failed", "key": manifest_key,
+                "operation": "protect_pdf", "reason": reason}
+
+    try:
+        with temp_workdir(prefix="pdf-protect-") as workdir:
+            manifest_file = os.path.join(workdir, "request.protect.json")
+            print("Downloading protect request s3://%s/%s" % (bucket, manifest_key))
+            try:
+                s3_client.download_file(bucket, manifest_key, manifest_file)
+            except Exception as exc:
+                return failed("cannot download protect request: %s" % exc)
+            try:
+                request = load_protect_request(manifest_file)
+            except ProtectError as exc:
+                return failed(str(exc))
+
+            source_key = request["input"]
+            password = request["password"]
+            output_name = request["output_name"]
+            try:
+                validate_protect_input_key(source_key)
+            except ProtectError as exc:
+                return failed(str(exc))
+            head_size = s3_client.head_object_size(bucket, source_key)
+            if head_size is not None:
+                ok, reason = size_ok(head_size, cfg.max_file_size_mb)
+                if not ok:
+                    return failed("input %r %s" % (source_key, reason))
+
+            local_input = os.path.join(workdir, "input.pdf")
+            print("Downloading protect input s3://%s/%s" % (bucket, source_key))
+            try:
+                s3_client.download_file(bucket, source_key, local_input)
+            except Exception as exc:
+                return failed("cannot download input %r: %s" % (source_key, exc))
+            ok, reason = validate_local_pdf(local_input, cfg.max_file_size_mb)
+            if not ok:
+                return failed("input %r %s" % (source_key, reason))
+
+            try:
+                page_count = protect_page_count_of(local_input, source_key)
+            except ProtectError as exc:
+                return failed(str(exc))
+
+            protected_file = os.path.join(workdir, "protected.pdf")
+            print("Protecting %d page(s) for manifest=%r"
+                  % (page_count, manifest_key))
+            try:
+                protect_pdf(
+                    local_input, source_key, password, protected_file)
+            except ProtectError as exc:
+                return failed(str(exc))
+            finally:
+                # Clear the sensitive value on every path, plain or failing,
+                # before anything else in this workdir scope runs/returns.
+                password = None
+                del password
+                request = None
+                del request
+
+            out_key = protect_output_key_for(
+                output_name, manifest_key)
+            print("Uploading s3://%s/%s" % (cfg.output_bucket, out_key))
+            try:
+                s3_client.upload_file(protected_file, cfg.output_bucket, out_key)
+            except Exception as exc:
+                return failed("cannot upload protected PDF: %s" % exc)
+    except Exception as exc:  # per-record isolation: never raise
+        traceback.print_exc()
+        return failed(str(exc))
+
+    print("Protect done manifest=%r -> %r" % (manifest_key, out_key))
+    return {"status": "ok", "key": manifest_key, "operation": "protect_pdf",
             "output_key": out_key}
 
 

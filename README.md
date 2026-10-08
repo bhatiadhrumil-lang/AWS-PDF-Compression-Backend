@@ -2,9 +2,9 @@
 
 Official backend source of truth for the PDF platform's server-side processing.
 Today: **PDF compression**, **PDF merge**, **PDF split**, **PDF rotate**,
-**Delete Pages** — all five implemented, deployed, and verified end-to-end
-on AWS — plus **Edit PDF v1**, **Extract Pages**, and **JPG to PDF**
-(all three implemented, tested, not yet deployed). More
+**Delete Pages**, **PDF to JPG**, and **Protect PDF** — all deployed and
+verified end-to-end on AWS — plus **Edit PDF v1**, **Extract Pages**, and
+**JPG to PDF** (implemented and tested, notification pending). More
 operations will plug into `src/operations/` later.
 
 > Image convention: `pdf-compressor:latest` (ECR → Lambda). No `v1`/`v2`/`v3`
@@ -49,14 +49,20 @@ S3 input bucket  (ObjectCreated)
                          process_jpg_to_pdf_record using
                          operations/jpg_to_pdf.py
                          → output jpg-to-pdf/<request-id>/<name>.pdf)
- └── *.pdf2jpg.json     (PDFToJPG notification, prefix pdf-to-jpg-requests/
-                         — DEPLOYED; code routes it to
-                         process_pdf_to_jpg_record using
-                         operations/pdf_to_jpg.py
-                         → output pdf-to-jpg/<request-id>/<stem>-page-001.jpg …)
- (EditPDF notification `*.edit.json`, prefix edit-requests/ — NOT deployed yet;
-  code routes it to process_edit_record using operations/edit.py → output
-  edit/<request-id>/<stem>-edited.pdf.)
+└── *.pdf2jpg.json     (PDFToJPG notification, prefix pdf-to-jpg-requests/
+                           — DEPLOYED; code routes it to
+                           process_pdf_to_jpg_record using
+                           operations/pdf_to_jpg.py
+                           → output pdf-to-jpg/<request-id>/<stem>-page-001.jpg …)
+  └── *.protect.json     (ProtectPDF notification, prefix protect-requests/
+                           — DEPLOYED; code routes it to
+                           process_protect_record using
+                           operations/protect_pdf.py
+                           → output protected/<request-id>/<stem>-protected.pdf,
+                           AES-256 password-encrypted; password never logged)
+  (EditPDF notification `*.edit.json`, prefix edit-requests/ — NOT deployed yet;
+   code routes it to process_edit_record using operations/edit.py → output
+   edit/<request-id>/<stem>-edited.pdf.)
 → frontend polls HeadObject, downloads via presigned URL
 ```
 
@@ -74,6 +80,7 @@ src/
     extract.py           pypdf extract-pages (one input -> one subset PDF)
     jpg_to_pdf.py        reportlab images-to-PDF (N images -> one PDF)
     pdf_to_jpg.py        ghostscript PDF pages-to-JPG (one PDF -> N JPGs)
+    protect_pdf.py       pypdf AES-256 password-encrypt (one PDF -> one protected PDF)
     edit.py              overlay edits (one input -> one edited PDF, NOT deployed)
   common/
     s3.py                head/download/upload (lazy boto3 import)
@@ -110,12 +117,16 @@ digest for rollback (e.g. pre-merge image
   (currently the delete-pages image
   `sha256:c0eefc345f5f73f5c40a1b103f55f5ddf710596450cc9dabda68eeba1c4a0e7a`;
   Lambda `CodeSha256` confirms it).
-* Input bucket: `pdf-compressor-input-868942372673` with five notifications
+* Input bucket: `pdf-compressor-input-868942372673` with NINE notifications
   on the same Lambda: `CompressPDF` (`ObjectCreated:*`, suffix `.pdf`),
   `MergePDF` (`ObjectCreated:*`, suffix `.merge.json`), `SplitPDF`
   (`ObjectCreated:*`, suffix `.split.json`), `RotatePDF`
-  (`ObjectCreated:*`, suffix `.rotate.json`), and `DeletePDF`
-  (`ObjectCreated:*`, suffix `.delete.json`).
+  (`ObjectCreated:*`, suffix `.rotate.json`), `DeletePDF`
+  (`ObjectCreated:*`, suffix `.delete.json`), `ExtractPDF`
+  (`ObjectCreated:*`, suffix `.extract.json`), `JPGToPDF`
+  (`ObjectCreated:*`, suffix `.jpg2pdf.json`), `PDFToJPG`
+  (`ObjectCreated:*`, suffix `.pdf2jpg.json`), and `ProtectPDF`
+  (`ObjectCreated:*`, suffix `.protect.json`).
 * Output bucket: `pdf-compressor-output-868942372673`.
 * Lambda execution role (`S3Access` inline): Get/List on the input bucket,
   Put on the output bucket — already covers manifests + merge inputs, so no
@@ -135,8 +146,11 @@ digest for rollback (e.g. pre-merge image
   (compression), `ObjectCreated:*` with `.merge.json` suffix filter →
   same Lambda (merge), `ObjectCreated:*` with `.split.json` suffix filter →
   same Lambda (split), `ObjectCreated:*` with `.rotate.json` suffix
-  filter → same Lambda (rotate), and `ObjectCreated:*` with `.delete.json`
-  suffix filter → same Lambda (delete).
+  filter → same Lambda (rotate), `ObjectCreated:*` with `.delete.json`
+  suffix filter → same Lambda (delete), `ObjectCreated:*` with
+  `.extract.json` / `.jpg2pdf.json` / `.pdf2jpg.json` suffix filters → same
+  Lambda (extract / jpg-to-pdf / pdf-to-jpg), and `ObjectCreated:*` with
+  `.protect.json` suffix filter → same Lambda (protect).
 * The handler accepts `.pdf` / `.PDF` / `.Pdf` (case-insensitive) even though
   the bucket filter itself is case-sensitive.
 
@@ -209,9 +223,8 @@ page selection reuses the `SPLIT_MAX_RANGES` cap.
 
 ### Extract Pages
 
-Status: Backend implemented + tested, **NOT deployed** (no `.extract.json`
-trigger yet; needs the same one-line notification as split/rotate/delete
-plus an image rebuild — deployment happens separately, never from here).
+Status: Backend implemented + tested + **deployed** (`.extract.json`
+trigger live; verified end-to-end on AWS).
 
 Single-file, single-output operation: one source PDF + manifest →
 one `extract/<request-id>/<stem>-extracted.pdf` containing ONLY the
@@ -222,10 +235,8 @@ exactly that order. The source PDF is never modified. New cap
 
 ### JPG to PDF
 
-Status: Backend implemented + tested, **NOT deployed** (no `.jpg2pdf.json`
-trigger yet; needs the same one-line notification as the other manifest
-operations plus an image rebuild — deployment happens separately, never
-from here).
+Status: Backend implemented + tested + **deployed** (`.jpg2pdf.json`
+trigger live; verified end-to-end on AWS).
 
 Multi-file, single-output operation: N ordered JPEGs + manifest →
 one `jpg-to-pdf/<request-id>/<safe-name>.pdf` with one image per page in
@@ -251,6 +262,25 @@ real rasterized JPGs, never renamed PDFs. Page list is explicit ints and/or
 range tokens, validated against the document page count, duplicates
 normalized (first wins) so filenames can never collide. New cap
 `PDF2JPG_MAX_PAGES` (default 50, same timeout rationale as split).
+
+### Protect PDF
+
+Status: Backend implemented + tested + **deployed** (`.protect.json`
+trigger `ProtectPDF` live; end-to-end verification lands with the Protect
+PDF deployment phase).
+
+Single-file, single-output operation: one source PDF + manifest → one
+password-encrypted PDF at `protected/<request-id>/<stem>-protected.pdf`.
+The new copy is encrypted with **pypdf AES-256** (`PdfWriter.encrypt`,
+`ENCRYPT_ALGORITHM = "AES-256"`); the source is never modified and never
+encrypted itself. Encrypted PDFs are rejected as inputs — a PDF that is
+already locked cannot be re-protected. Password handling is treated as
+SENSITIVE end to end: the password rides ONLY in the uploaded manifest
+(the single object that must contain it), it is never logged, never
+appears in error messages, output keys, or filenames, and the handler
+clears it from memory as soon as encryption finishes. Owner and user
+passwords are set to the same value and all permissions are granted
+(protection only — no fake print/copy/print rules UI).
 
 ### Edit PDF (professional editor)
 
@@ -605,6 +635,45 @@ PDF, invalid page numbers, empty selection, too many pages, invalid
 quality, render failure, upload failure. User-safe reasons; tracebacks to
 CloudWatch only.
 
+## Protect request contract
+
+Manifest `protect-requests/<request-id>.protect.json`, uploaded AFTER the
+source PDF (same input bucket):
+
+```json
+{ "operation": "protect_pdf",
+  "input": "uploads/<request-id>/document.pdf",
+  "password": "…",
+  "output_name": "document" }
+```
+
+* `operation` optional (`.protect.json` suffix implies protect_pdf; if
+  present must equal `"protect_pdf"`).
+* `input` (required): EXACT S3 key in the same input bucket, used verbatim
+  (never URL-decoded); must name a `.pdf` (any case), must exist, and must
+  pass per-file size (`MAX_FILE_SIZE_MB`), PDF-magic, non-empty, and
+  **not-encrypted** checks like every other PDF input.
+* `password` (required): non-empty string of **at least 8 characters**
+  (`PROTECT_MIN_PASSWORD_LEN`, a fixed module constant — not env-overridable,
+  no complexity rules). It is read from the manifest, used only to encrypt,
+  and cleared immediately after. It is never echoed into any output,
+  error, or log.
+* `output_name` (optional stem): same sanitization as split/rotate/delete
+  (no path traversal, spaces/parens/unicode preserved); falls back to the
+  request id.
+
+Output: one AES-256-encrypted PDF at `protected/<request-id>/<stem>-protected.pdf`
+(request id always embedded — the frontend polls this EXACT key; dedicated
+namespace, never the extract/edit directories).
+
+Result shape: `{"status": "ok"|"failed", "key": manifest, "operation":
+"protect_pdf", "output_key": ..., "reason": ...}`. Covered failures: missing
+/ malformed manifest, wrong operation, missing input key or S3 object,
+non-PDF extension, oversize input, invalid/corrupted/encrypted/empty PDF,
+missing/empty/short password, encryption failure, upload failure.
+User-safe reasons (the password is never part of them); tracebacks to
+CloudWatch only.
+
 ## Edit request contract (v1)
 
 Manifest `edit-requests/<request-id>.edit.json`, uploaded AFTER the source
@@ -760,6 +829,8 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 * Least privilege preserved: Lambda role = Get/List on input, Put on output,
   basic execution logs. Buckets stay private; the frontend uses short-lived
   Cognito credentials + 5-minute presigned downloads.
+* Protect PDF password: carried only in the request manifest, cleared from
+  memory after encryption, never logged/echoed (regression-tested).
 * See `tests/` for the executable form of these guarantees.
 
 ## Configuration
@@ -783,15 +854,19 @@ Each record gets a unique `mkdtemp` workdir, removed in a `finally`
 | `GHOSTSCRIPT_BIN` | no | `gs` | gs binary override (tests/CI) |
 | `S3_ENDPOINT_URL` | no | — | S3-compatible endpoint override (local dev) |
 
+Protect PDF adds **no** env vars: the minimum password length is the fixed
+module constant `PROTECT_MIN_PASSWORD_LEN = 8` in `operations/protect_pdf.py`
+and `ENCRYPT_ALGORITHM = "AES-256"` selects the cipher.
+
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v   # 487 tests, no AWS credentials needed
+python3 -m unittest discover -s tests -v   # 544 tests, no AWS credentials needed
 python3 -m py_compile src/app.py src/handler.py src/config.py \
   src/operations/compress.py src/operations/merge.py \
   src/operations/split.py src/operations/rotate.py \
   src/operations/extract.py src/operations/jpg_to_pdf.py \
-  src/operations/pdf_to_jpg.py \
+  src/operations/pdf_to_jpg.py src/operations/protect_pdf.py \
   src/operations/delete_pages.py src/operations/edit.py src/common/*.py
 ```
 
@@ -821,7 +896,13 @@ edit routing and config, plus extract: single/multi/range/mixed selections,
 requested-order preservation, duplicate normalization, parser rejects
 (0/negative/reversed/malformed/empty), out-of-bounds pages, empty selection,
 corrupted/missing inputs, output page count and content, source untouched,
-extract routing and config.
+extract routing and config, plus protect: valid request encrypts, page count,
+content and metadata preserved, correct password decrypts, wrong password
+rejected, missing/empty/short/non-string passwords rejected, missing/
+corrupted/encrypted inputs rejected, output-name sanitization
+(spaces/unicode/traversal/empty fallback), password never in logs/errors/
+keys (success and failure paths), temp cleanup, protect routing and default
+constants.
 
 ## Docker
 
@@ -832,9 +913,10 @@ maintained) does merge concatenation; Ghostscript settings are untouched.
 ## Future Architecture
 
 `src/operations/` now hosts `compress.py`, `merge.py`, `split.py`,
-`rotate.py`, and `delete_pages.py`. Future `extract.py`, `convert.py`,
-plus editor flattening follow the same pattern, reusing `common/` (s3,
-filenames, validation, cleanup) — parameterized ones reuse the
+`rotate.py`, `delete_pages.py`, `extract.py`, `jpg_to_pdf.py`,
+`pdf_to_jpg.py`, and `protect_pdf.py`. Future
+`convert.py`, plus editor flattening follow the same pattern, reusing
+`common/` (s3, filenames, validation, cleanup) — parameterized ones reuse the
 manifest-request pattern.
 
 ## Cost

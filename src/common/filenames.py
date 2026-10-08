@@ -27,6 +27,8 @@ EDIT_MANIFEST_SUFFIX = ".edit.json"
 EDIT_OUTPUT_DIR = "edit"
 PDF2JPG_MANIFEST_SUFFIX = ".pdf2jpg.json"
 PDF2JPG_OUTPUT_DIR = "pdf-to-jpg"
+PROTECT_MANIFEST_SUFFIX = ".protect.json"
+PROTECT_OUTPUT_DIR = "protected"
 MAX_OUTPUT_BASENAME_LEN = 200
 
 
@@ -124,6 +126,15 @@ def is_pdf_to_jpg_manifest_key(decoded_key):
     routed to the pdf_to_jpg operation instead of compression.
     """
     return str(decoded_key).lower().endswith(PDF2JPG_MANIFEST_SUFFIX)
+
+
+def is_protect_manifest_key(decoded_key):
+    """True if the key is a protect-request manifest (case-insensitive).
+
+    Manifests live under e.g. "protect-requests/<id>.protect.json" and are
+    routed to the protect_pdf operation instead of compression.
+    """
+    return str(decoded_key).lower().endswith(PROTECT_MANIFEST_SUFFIX)
 
 
 def pdf_to_jpg_page_key_for(stem, request_id, page_num):
@@ -363,3 +374,24 @@ def extract_output_key_for(output_name, manifest_key=""):
         pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-extracted.pdf")]
                     + "-extracted.pdf")
     return "%s/%s/%s" % (EXTRACT_OUTPUT_DIR, request_id, pdf_name)
+
+
+def protect_output_key_for(output_name, manifest_key=""):
+    """Build the protected-PDF output key: "protected/<id>/<stem>-protected.pdf".
+
+    <id> comes from the manifest basename ("<id>.protect.json"); if the
+    manifest is oddly shaped the id segment falls back to "request".
+    The stem falls back to the id (or "document"). The key always embeds
+    the request id, so the frontend can poll this EXACT key and concurrent
+    users can never collide.
+    """
+    request_id = sanitize_split_stem(
+        request_id_from_manifest(manifest_key, PROTECT_MANIFEST_SUFFIX))
+    if not request_id:
+        request_id = "request"
+    stem = sanitize_split_stem(output_name) or request_id
+    pdf_name = "%s-protected.pdf" % stem
+    if len(pdf_name) > MAX_OUTPUT_BASENAME_LEN:
+        pdf_name = (stem[: MAX_OUTPUT_BASENAME_LEN - len("-protected.pdf")]
+                    + "-protected.pdf")
+    return "%s/%s/%s" % (PROTECT_OUTPUT_DIR, request_id, pdf_name)
